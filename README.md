@@ -17,8 +17,10 @@ Documentation: [Python SDK guide](https://docs.litwizlabs.com/documentation/sdk-
 ## Install
 
 ```sh
-pip install --pre bakbak     # 1.0 is in release candidates; drop --pre after 1.0.0
+pip install --pre bakbak-python     # 1.0 is in release candidates; drop --pre after 1.0.0
 ```
+
+The package is `bakbak-python` on PyPI; you import it as `bakbak`.
 
 Python 3.10 or newer.
 

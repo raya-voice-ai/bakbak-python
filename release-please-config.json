@@ -3,7 +3,7 @@
   "packages": {
     ".": {
       "release-type": "python",
-      "package-name": "bakbak",
+      "package-name": "bakbak-python",
       "changelog-path": "CHANGELOG.md",
       "include-v-in-tag": true,
       "prerelease": true,

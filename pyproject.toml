@@ -3,7 +3,7 @@ requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
 
 [project]
-name = "bakbak"
+name = "bakbak-python"
 dynamic = ["version"]
 description = "Official Python SDK for the Bakbak text-to-speech API by Raya"
 readme = "README.md"

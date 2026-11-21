@@ -30,7 +30,7 @@ wheels = [
 ]
 
 [[package]]
-name = "bakbak"
+name = "bakbak-python"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

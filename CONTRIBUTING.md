@@ -76,4 +76,5 @@ release-please writes them as `1.0.0-rc.N`, which PyPI normalises). To release
 release.
 
 PyPI must list this repository's `release-please.yml` workflow and its `pypi`
-environment as a trusted publisher before the first publish.
+environment as a trusted publisher of the `bakbak-python` project before the first
+publish. (The distribution is `bakbak-python`; the import package is `bakbak`.)
