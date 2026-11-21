@@ -18,6 +18,7 @@ import http
 import json
 import socket
 import threading
+import time
 from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -138,6 +139,8 @@ class MockHTTPServer:
         exchange = self.exchanges[index]
         self._check(index, exchange["expect_request"], handler, raw)
         response = exchange["response"]
+        if response.get("delay"):  # unit tests only: answer late
+            time.sleep(response["delay"])
         if response.get("network_error"):
             handler.close_connection = True
             return
@@ -148,7 +151,11 @@ class MockHTTPServer:
             self._send(handler, response["status"], headers, response["sse"].encode(), stream=True)
         else:
             body = base64.b64decode(response["body_base64"])
-            self._send(handler, response["status"], headers, body)
+            # Unit tests only: declare more bytes than are sent, then hang up.
+            length = response.get("content_length")
+            if length is not None:
+                headers["Content-Length"] = str(length)
+            self._send(handler, response["status"], headers, body, stream=length is not None)
 
     def _check(
         self, index: int, expected: dict[str, Any], handler: BaseHTTPRequestHandler, raw: bytes
