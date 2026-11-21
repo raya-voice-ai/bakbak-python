@@ -139,12 +139,13 @@ def test_long_words_and_hard_cuts_match_the_reference() -> None:
     single split."""
     reference = _reference()
     parts = ["dr", "etc", "no", "a", "1", "22", "prof", "approx", "x" * 7, "क्ष" * 4, "डॉ"]
+    gaps = ["", ".", ". ", " ", "\n", ". A", ".\n", ". " + " " * 12, ".\n\t \t  ", "\t" * 9]
     rng = random.Random(7)
     for _ in range(1500):
         words = []
         for _ in range(rng.randint(1, 12)):
             word = "".join(rng.choice(parts) for _ in range(rng.randint(1, 4)))
-            words.append(word + rng.choice(["", ".", ". ", " ", "\n", ". A", ".\n"]))
+            words.append(word + rng.choice(gaps))
         text = rng.choice([" ", ""]).join(words)
         options: dict[str, Any] = {
             "min_chars": rng.choice([0, 1, 20]),
@@ -174,3 +175,27 @@ def test_segmentation_is_linear(text: str) -> None:
     started = time.perf_counter()
     assert _stream(text, [text[i : i + 6] for i in range(0, len(text), 6)], {}) == whole
     assert time.perf_counter() - started < 5.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "This is the end." + " " * 10 + "1. x and then more words.",
+        "This is the end." + " \t" * 40 + "12. x and then more words.",
+        "This is the end.\n" + " " * 10 + "1. x and then more words.",
+        "Item" + " " * 30 + "3. x is next.",
+    ],
+    ids=["spaces", "spaces-and-tabs", "newline-then-spaces", "word-then-spaces"],
+)
+@pytest.mark.parametrize("min_chars", [0, 20])
+def test_space_run_before_a_list_marker(text: str, min_chars: int) -> None:
+    """Whether "1." starts a line depends on the character before a run of
+    spaces, however long: trimming the buffer inside the run must not turn a
+    boundary into a list marker (or the reverse)."""
+    reference = _reference()
+    options: dict[str, Any] = {"min_chars": min_chars}
+    expected = reference.split_sentences(text, reference.Options(**options))
+    assert split_sentences(text, **options) == expected
+    assert _stream(text, list(text), options) == expected
+    for cut in range(1, len(text)):
+        assert _stream(text, [text[:cut], text[cut:]], options) == expected, cut

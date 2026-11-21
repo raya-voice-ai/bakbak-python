@@ -259,31 +259,35 @@ def _wrap_cut(text: str, start: int, max_chars: int) -> int:
     return cut if cut > start + 1 else window_end
 
 
-# The longest word a full-stop rule looks at: a title, an ambiguous
-# abbreviation, or 1-3 digits. A longer word never matches any rule.
-_LONGEST_RULE_WORD = max(3, *(len(w) for w in _TITLES | _AMBIGUOUS))
+# The longest word any rule compares (titles, ambiguous abbreviations,
+# list-marker digits) has 6 code points, so 8 code points of a word are enough
+# to know it is none of them.
+_LOOKBEHIND_WORD = 8
 
 
-def _keep_from(text: str, gs: int) -> int:
-    """Where the buffer can be trimmed when the pending text starts at ``gs``.
+def _lookbehind(text: str, gs: int) -> str:
+    """The text a streaming segmenter keeps before the group start ``gs``.
 
     The boundary rules look behind a full stop: at the word before it, and at
-    whether that word starts a line. Trimming at ``gs`` would lose that context
-    (a list marker such as "1." right after an emitted sentence, or a full stop
-    right after a hard cut). Keeping the word before ``gs``, the spaces before
-    it, and one more character makes each look-behind stop exactly where it
-    stops in the whole text. A word longer than any rule's word is kept only in
-    part: its tail is still too long to match a rule, and a text with no spaces
-    no longer keeps everything it has seen.
+    whether that word starts a line. They need only the last few characters of
+    that word and, when the word is short, what precedes it: a run of spaces
+    or tabs (one stands for any number) and the character before the run, or
+    nothing at the start of the text. Keeping exactly that bounds the buffer
+    however long the text is, and gives every decision the answer it would
+    have on the whole text. The kept text is never emitted, so it need not be
+    a slice of the input.
     """
-    t = gs
-    while t > 0 and _is_word_char(text[t - 1]):
-        t -= 1
-        if gs - t > _LONGEST_RULE_WORD:
-            return t
-    while t > 0 and text[t - 1] in (" ", "\t"):
-        t -= 1
-    return t - 1 if t > 0 else 0
+    w = gs
+    while w > 0 and _is_word_char(text[w - 1]):
+        w -= 1
+    if gs - w >= _LOOKBEHIND_WORD:
+        return text[gs - _LOOKBEHIND_WORD : gs]
+    i = w
+    while i > 0 and text[i - 1] in (" ", "\t"):
+        i -= 1
+    gap = " " if i < w else ""
+    before = text[i - 1] if i > 0 else ""
+    return before + gap + text[w:gs]
 
 
 def _check_option(name: str, value: int, low: int, high: int | None = None) -> int:
@@ -345,7 +349,7 @@ class Segmenter:
             "first_clause_min_chars", first_clause_min_chars, 0
         )
         self._buf = ""
-        self._start = 0  # where the pending text starts in _buf (see _keep_from)
+        self._start = 0  # where the pending text starts in _buf (see _lookbehind)
         self._first = True
         self._wrapping = False  # inside a wrapped group: no merging until it ends
 
@@ -427,9 +431,9 @@ class Segmenter:
                 self._emit(out, _strip(text[gs:]))
                 gs = len(text)
             break
-        keep = _keep_from(text, gs)
-        self._buf = text[keep:]
-        self._start = gs - keep
+        context = _lookbehind(text, gs)
+        self._buf = context + text[gs:]
+        self._start = len(context)  # where the pending text starts in _buf
         return out
 
 
