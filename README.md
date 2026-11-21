@@ -10,6 +10,10 @@ or over a WebSocket built for voice agents.
 - Automatic, safe retries: never after audio has been delivered
 - Typed throughout (`py.typed`), with three runtime dependencies: `httpx`, `websockets`, `typing-extensions`
 
+Documentation: [Python SDK guide](https://docs.litwizlabs.com/documentation/sdk-python) ·
+[WebSocket API reference](https://docs.litwizlabs.com/api-reference/tts-websocket) ·
+[Errors](https://docs.litwizlabs.com/documentation/tts-errors)
+
 ## Install
 
 ```sh
@@ -169,15 +173,18 @@ async with client.tts.websocket(
   `RequestResult(request_id, audio_bytes, cancelled)` or raises the request's
   error, and `async for audio in handle` yields that request's audio.
 - **Cancel.** `await ctx.cancel()` stops the context at once: unfinished requests
-  end as `Cancelled`, and audio not yet handed to you is dropped. The context
-  stays usable.
+  end as `Cancelled`, all of its audio not yet handed to you is dropped, and a
+  `send_stream` feeding it stops sending and returns. The cancel still reaches the
+  server if the task calling it is itself cancelled. The context stays usable.
 - **Connection management.** The first send opens the socket if you did not.
   Server restarts (close 1001, or a draining refusal) are handled by resending on
   a new connection; a dropped connection fails only the requests that already
   had audio (`StreamInterruptedError`) and resends the rest. Every unfinished
-  request always gets an outcome. `send()` waits only if the connection's limits
-  (64 unfinished requests, 16 busy contexts) are reached; open more WebSockets
-  for more parallelism.
+  request always gets an outcome, and cancelling the task awaiting `send()` never
+  leaves a half-sent request behind. `send()` waits only if the connection's
+  limits (64 unfinished requests, 16 busy contexts) are reached; open more
+  WebSockets for more parallelism. A WebSocket can live for days: finished
+  contexts are released, so its memory does not grow with the requests it serves.
 - **Connection-level errors.** Errors about no request in particular go to
   `client.tts.websocket(on_error=callback)`.
 
@@ -299,8 +306,13 @@ except bakbak.APIConnectionError:
     print("Could not reach the API")
 ```
 
-Errors never contain your API key or request headers, in any attribute, `str()`
-or `repr()`.
+Errors never contain your API key or request headers, in any attribute, `str()`,
+`repr()` or chained cause. A key with whitespace, control or non-ASCII characters
+(a copy-paste slip) is refused when the client is created, without echoing it.
+The SDK never follows redirects, on HTTP or the WebSocket: a 3xx is an
+`APIStatusError`, so the key is never sent to another origin. See the
+[error reference](https://docs.litwizlabs.com/documentation/tts-errors) for every
+`error_code`.
 
 ## Retries and timeouts
 
@@ -361,6 +373,9 @@ logging.getLogger("bakbak").setLevel(logging.DEBUG)
 
 ## More
 
+- [Python SDK guide](https://docs.litwizlabs.com/documentation/sdk-python)
+- [WebSocket API reference](https://docs.litwizlabs.com/api-reference/tts-websocket)
+- [Errors and error codes](https://docs.litwizlabs.com/documentation/tts-errors)
 - [`examples/`](examples): runnable scripts for each feature
 - [`conformance/BEHAVIOR.md`](conformance/BEHAVIOR.md): the behaviour every official
   Bakbak client follows, and the API in one page

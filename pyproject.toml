@@ -33,6 +33,7 @@ classifiers = [
 ]
 
 [project.urls]
+Documentation = "https://docs.litwizlabs.com/documentation/sdk-python"
 Repository = "https://github.com/raya-voice-ai/bakbak-python"
 Issues = "https://github.com/raya-voice-ai/bakbak-python/issues"
 Changelog = "https://github.com/raya-voice-ai/bakbak-python/blob/main/CHANGELOG.md"
