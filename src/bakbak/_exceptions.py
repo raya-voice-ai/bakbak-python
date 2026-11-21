@@ -320,8 +320,9 @@ def error_message(body: object, status: int | None, reason: str | None = None) -
         )
         if message:
             if detail_text and detail_text not in message:
-                joiner = " " if message.endswith((".", "!", "?")) else ": "
-                return f"{message}{joiner}{detail_text}"
+                base = message.rstrip()  # trailing whitespace does not count
+                joiner = " " if base.endswith((".", "!", "?")) else ": "
+                return f"{base}{joiner}{detail_text}"
             return message
         if isinstance(detail, str) and detail.strip():
             return detail

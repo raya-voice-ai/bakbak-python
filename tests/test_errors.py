@@ -87,6 +87,18 @@ RENDERED = (
             "Invalid: voice_id: Field required",
         ),
         (
+            {"message": "Invalid.  ", "detail": DETAIL[:1]},
+            422,
+            None,
+            "Invalid. voice_id: Field required",
+        ),
+        (
+            {"message": "Invalid \n", "detail": DETAIL[:1]},
+            422,
+            None,
+            "Invalid: voice_id: Field required",
+        ),
+        (
             {"message": "Invalid request: voice_id: Field required.", "detail": DETAIL[:1]},
             422,
             None,
