@@ -28,7 +28,12 @@ def _reference() -> ModuleType:
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module  # its dataclasses look their module up
-    spec.loader.exec_module(module)
+    # Never write bytecode into conformance/: it must match its manifest.
+    previous, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 
 
