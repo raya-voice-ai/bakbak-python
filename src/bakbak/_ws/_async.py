@@ -12,7 +12,16 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Coroutine, Generator, Iterable
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Generator,
+    Iterable,
+    Mapping,
+)
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +52,16 @@ if TYPE_CHECKING:
 __all__ = ["AsyncContext", "AsyncRequestHandle", "AsyncTTSWebSocket"]
 
 
+class _Connect(connect):
+    """``connect`` that never follows a redirect: the API never redirects, and
+    a redirect would carry ``X-API-Key`` to another origin (§8). A 3xx is
+    raised as ``InvalidStatus`` and becomes an ``APIStatusError``."""
+
+    @override
+    def process_redirect(self, exc: Exception) -> Exception | str:
+        return exc
+
+
 class _Signal:
     """An ``asyncio.Event`` used as a wake-up: check, then ``wait()``."""
 
@@ -66,7 +85,12 @@ def _signal(core_signal: object) -> _Signal:
     return core_signal
 
 
-async def _iterate(tokens: Iterable[object] | AsyncIterable[object]) -> AsyncIterator[object]:
+_STOP = object()
+
+
+async def _iterate(
+    tokens: Iterable[object] | AsyncIterable[object],
+) -> AsyncGenerator[object, None]:
     if isinstance(tokens, AsyncIterable):
         async for item in tokens:
             yield item
@@ -191,6 +215,18 @@ class AsyncContext:
         requests, or 16 busy contexts); a server-side failure does not raise
         here but becomes the request's outcome.
         """
+        handle = await self._send(params, extra_body, None)
+        assert handle is not None
+        return handle
+
+    async def _send(
+        self,
+        params: Mapping[str, object],
+        extra_body: Mapping[str, object] | None,
+        epoch: int | None,
+    ) -> AsyncRequestHandle | None:
+        """Send one request; with ``epoch``, send nothing (and return None) if
+        the context was cancelled since that epoch."""
         ws = self._ws
         core = ws._core
         ctx = self._ctx
@@ -202,11 +238,22 @@ class AsyncContext:
                 raise BakbakError("This WebSocket is closed.")
             if ctx.input_ended:
                 raise BakbakError("end_input() was called on this context; use a new context.")
+            if epoch is not None and ctx.cancel_epoch != epoch:
+                return None
             if not core.at_capacity(ctx):
                 break
             await _signal(core.capacity).wait()
         request = core.submit(ctx, wire, width, lambda r: AsyncRequestHandle(r, self))
-        await ws._flush()
+        try:
+            # The flush runs in its own task: cancelling this call cannot cut a
+            # batch of writes short, so the core always matches the wire.
+            await asyncio.shield(ws._spawn(ws._flush()))
+        except asyncio.CancelledError:
+            # The caller gave up before getting the handle. If the request was
+            # not written yet, take it back: nothing it abandoned is sent or
+            # billed. If it was, its outcome still reaches the context.
+            core.withdraw(request)
+            raise
         handle: AsyncRequestHandle = request.handle
         return handle
 
@@ -233,18 +280,69 @@ class AsyncContext:
         """
         splitter = segmenter or Segmenter()
         handles: list[AsyncRequestHandle] = []
+        epoch = self._ctx.cancel_epoch
+        items = _iterate(tokens)
+        racing = isinstance(tokens, AsyncIterable)
         try:
-            async for item in _iterate(tokens):
+            while True:
+                item = await self._next_item(items, epoch, racing)
+                if item is _STOP:
+                    break
                 text = text_delta(item)
-                if text:
-                    for sentence in splitter.push(text):
-                        handles.append(await self.send(text=sentence, **params))
+                if not text:
+                    continue
+                for sentence in splitter.push(text):
+                    handle = await self._send({**params, "text": sentence}, None, epoch)
+                    if handle is None:
+                        return handles
+                    handles.append(handle)
             for sentence in splitter.flush():
-                handles.append(await self.send(text=sentence, **params))
+                handle = await self._send({**params, "text": sentence}, None, epoch)
+                if handle is None:
+                    return handles
+                handles.append(handle)
         finally:
+            await items.aclose()
             if end_input:
                 self.end_input()
         return handles
+
+    async def _next_item(
+        self, items: AsyncGenerator[object, None], epoch: int, racing: bool
+    ) -> object:
+        """The next token, or ``_STOP`` when the tokens end or the context is
+        cancelled: a cancel stops ``send_stream`` even while it waits for a
+        slow LLM (§6.3)."""
+        ctx = self._ctx
+        if ctx.cancel_epoch != epoch:
+            return _STOP
+        if not racing:
+            try:
+                return await items.__anext__()
+            except StopAsyncIteration:
+                return _STOP
+        getter = asyncio.ensure_future(items.__anext__())
+        watcher = asyncio.ensure_future(self._cancelled_since(epoch))
+        try:
+            await asyncio.wait({getter, watcher}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            watcher.cancel()
+            if not getter.done():
+                # Stop waiting for the token, and let the generator finish
+                # before it is closed.
+                getter.cancel()
+                await asyncio.gather(getter, return_exceptions=True)
+        if ctx.cancel_epoch != epoch or getter.cancelled():
+            return _STOP
+        try:
+            return getter.result()
+        except StopAsyncIteration:
+            return _STOP
+
+    async def _cancelled_since(self, epoch: int) -> None:
+        core = self._ws._core
+        while self._ctx.cancel_epoch == epoch and not core.closed:
+            await _signal(self._ctx.signal).wait()
 
     def end_input(self) -> None:
         """No more requests: ``events()`` and ``audio()`` end once every
@@ -263,7 +361,9 @@ class AsyncContext:
         core = ws._core
         conn = core.cancel(self._ctx)
         if conn is not None:
-            await ws._write(conn, core.cancel_message(self._ctx))
+            # The cancel must reach the wire even if this task is cancelled
+            # (barge-in often lands while an error is being handled).
+            await asyncio.shield(ws._spawn(ws._write(conn, core.cancel_message(self._ctx))))
         while self._ctx.cancels_pending and not core.closed:
             await _signal(self._ctx.cancel_signal).wait()
 
@@ -379,8 +479,7 @@ class AsyncTTSWebSocket:
         """Close the WebSocket. Unfinished requests fail with
         ``WebSocketClosedError``."""
         connections = self._core.close()
-        for conn in connections:
-            await self._close_transport(conn.transport)
+        await asyncio.gather(*(self._close_transport(c.transport) for c in connections))
         current = asyncio.current_task()
         pending = [t for t in self._tasks if t is not current]
         for task in pending:
@@ -420,10 +519,11 @@ class AsyncTTSWebSocket:
 
     # Internals
 
-    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
         task = asyncio.get_running_loop().create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
 
     async def _open(self) -> None:
         """Open a connection, retrying what can be retried."""
@@ -432,7 +532,7 @@ class AsyncTTSWebSocket:
         while True:
             started = time.monotonic()
             try:
-                transport = await connect(
+                transport = await _Connect(
                     url,
                     additional_headers=self._client.websocket_headers(),
                     user_agent_header=user_agent(),
@@ -447,24 +547,27 @@ class AsyncTTSWebSocket:
                 if mapped is None:
                     raise
                 error, retry_after = mapped
-                if not getattr(error, "retryable", False) or retries >= self._core.max_retries:
-                    raise error from exc
-                retries += 1
-                delay = retry_delay(retries, retry_after)
-                logger.debug(
-                    "WebSocket connect failed (%s); retrying in %.2f s", error.message, delay
-                )
-                await self._client._sleep(delay)
-                continue
-            logger.debug(
-                "WebSocket connected to %s in %.0f ms",
-                redact_url(url),
-                (time.monotonic() - started) * 1000,
-            )
-            conn = self._core.opened(transport)
-            self._spawn(self._read(conn))
-            self._ensure_watchdog()
+            else:
+                break
+            # Raised outside the except block: the error carries no chained
+            # exception from the WebSocket library.
+            if not getattr(error, "retryable", False) or retries >= self._core.max_retries:
+                raise error
+            retries += 1
+            delay = retry_delay(retries, retry_after)
+            logger.debug("WebSocket connect failed (%s); retrying in %.2f s", error.message, delay)
+            await self._client._sleep(delay)
+        logger.debug(
+            "WebSocket connected to %s in %.0f ms",
+            redact_url(url),
+            (time.monotonic() - started) * 1000,
+        )
+        if self._core.closed:  # closed while the handshake ran
+            await self._close_transport(transport)
             return
+        conn = self._core.opened(transport)
+        self._spawn(self._read(conn))
+        self._ensure_watchdog()
 
     async def _flush(self, force_connect: bool = False) -> None:
         """Open a connection if a request needs one, then send what can go."""
@@ -519,10 +622,12 @@ class AsyncTTSWebSocket:
             self._core.on_close(conn, transport.close_code or 1006, transport.close_reason or "")
 
     async def _close_transport(self, transport: ClientConnection) -> None:
+        """Close within about a second, even if the peer never answers."""
         try:
-            await transport.close()
+            await asyncio.wait_for(transport.close(), WS_CLOSE_TIMEOUT + 0.25)
         except Exception:
-            logger.debug("closing a WebSocket failed", exc_info=True)
+            logger.debug("closing a WebSocket failed; aborting it", exc_info=True)
+            transport.transport.abort()
 
     async def _retry_later(self, request: Request, delay: float) -> None:
         await self._client._sleep(delay)

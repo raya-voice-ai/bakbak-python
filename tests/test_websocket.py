@@ -414,7 +414,7 @@ async def test_an_unexpected_connect_failure_still_gives_an_outcome(
     async def broken(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(driver, "connect", broken)
+    monkeypatch.setattr(driver, "_Connect", broken)
     client = AsyncBakbak(api_key="test-key", base_url="http://localhost:9")
     ws = client.tts.websocket(**DEFAULTS)
     handle = await ws.context().send(text="Hello.")

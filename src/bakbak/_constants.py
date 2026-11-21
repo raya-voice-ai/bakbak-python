@@ -35,8 +35,9 @@ WS_MAX_UNFINISHED = 64
 WS_MAX_CONTEXTS = 16
 # Large enough for any server message; one chunk's base64 can be big.
 WS_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
-# How long the client waits for its own close handshake to complete.
-WS_CLOSE_TIMEOUT = 2.0
+# How long the client waits for its own close handshake before it drops the
+# connection: closing never waits much longer on an unresponsive peer.
+WS_CLOSE_TIMEOUT = 1.0
 # A connection that stayed open this long counts as healthy even if it never
 # received a message, so dropping it does not count as a failed reconnect.
 WS_HEALTHY_AFTER = 10.0

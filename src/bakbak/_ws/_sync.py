@@ -14,12 +14,13 @@ from __future__ import annotations
 import inspect
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
 from typing_extensions import Self, Unpack, override
 from websockets.exceptions import ConnectionClosed
+from websockets.sync import client as _sync_client
 from websockets.sync.client import ClientConnection, connect
 
 from .._constants import WS_CLOSE_TIMEOUT, WS_MAX_MESSAGE_BYTES
@@ -45,16 +46,29 @@ if TYPE_CHECKING:
 __all__ = ["Context", "RequestHandle", "TTSWebSocket"]
 
 
-# websockets 17.1 asks callers that manage the connection themselves (instead of
-# using `with connect(...)`) to say so with legacy=True; older releases have no
-# such argument and behave that way already.
-_CONNECT_KWARGS: dict[str, Any] = (
-    {"legacy": True} if "legacy" in inspect.signature(connect).parameters else {}
-)
+# From websockets 17.1 the threaded client follows redirects, through the
+# `reconnect` connecter that `connect` uses. A redirect would carry X-API-Key
+# to another origin (§8), so the SDK builds that connecter itself with
+# redirects refused. Earlier releases never follow redirects.
+_Reconnect: Any = getattr(_sync_client, "reconnect", None)
+_FOLLOWS_REDIRECTS = _Reconnect is not None and "legacy" in inspect.signature(connect).parameters
 
 
 def _connect(url: str, **kwargs: Any) -> ClientConnection:
-    return cast("ClientConnection", connect(url, **kwargs, **_CONNECT_KWARGS))
+    if not _FOLLOWS_REDIRECTS:
+        return cast("ClientConnection", connect(url, **kwargs))
+    connecter = _Reconnect(url, **kwargs)
+    connecter.process_redirect = _refuse_redirect
+    connection = cast("ClientConnection", connecter.connect())
+    # The SDK manages the connection's lifetime itself (websockets' "legacy" use).
+    connection.pending_legacy_warning = False  # pyright: ignore[reportAttributeAccessIssue]
+    return connection
+
+
+def _refuse_redirect(exc: Exception) -> Exception | str:
+    """Never follow a redirect: a 3xx is raised as ``InvalidStatus`` and
+    becomes an ``APIStatusError``."""
+    return exc
 
 
 class _Signal:
@@ -189,6 +203,18 @@ class Context:
         unfinished requests, or 16 busy contexts); a server-side failure does
         not raise here but becomes the request's outcome.
         """
+        handle = self._send(params, extra_body, None)
+        assert handle is not None
+        return handle
+
+    def _send(
+        self,
+        params: Mapping[str, object],
+        extra_body: Mapping[str, object] | None,
+        epoch: int | None,
+    ) -> RequestHandle | None:
+        """Send one request; with ``epoch``, send nothing (and return None) if
+        the context was cancelled since that epoch."""
         ws = self._ws
         core = ws._core
         ctx = self._ctx
@@ -201,6 +227,8 @@ class Context:
                     raise BakbakError("This WebSocket is closed.")
                 if ctx.input_ended:
                     raise BakbakError("end_input() was called on this context; use a new context.")
+                if epoch is not None and ctx.cancel_epoch != epoch:
+                    return None
                 if not core.at_capacity(ctx):
                     break
                 _signal(core.capacity).wait()
@@ -223,8 +251,10 @@ class Context:
         ``tokens`` is an iterable of ``str``, or of stream events from an LLM
         SDK (OpenAI, Anthropic or Gemini style; the text delta is found by
         duck typing). It blocks until ``tokens`` is exhausted, so read the
-        audio on another thread. Calls ``end_input()`` at the end unless
-        ``end_input=False``, also when ``tokens`` raises.
+        audio on another thread. A ``cancel()`` of the context stops it: it
+        sends nothing more and returns (after the next token arrives). Calls
+        ``end_input()`` at the end unless ``end_input=False``, also when
+        ``tokens`` raises.
 
         Args:
             segmenter: a configured :class:`bakbak.text.Segmenter`, e.g. with
@@ -232,14 +262,24 @@ class Context:
         """
         splitter = segmenter or Segmenter()
         handles: list[RequestHandle] = []
+        epoch = self._ctx.cancel_epoch
         try:
             for item in tokens:
+                if self._ctx.cancel_epoch != epoch:
+                    return handles
                 text = text_delta(item)
-                if text:
-                    for sentence in splitter.push(text):
-                        handles.append(self.send(text=sentence, **params))
+                if not text:
+                    continue
+                for sentence in splitter.push(text):
+                    handle = self._send({**params, "text": sentence}, None, epoch)
+                    if handle is None:
+                        return handles
+                    handles.append(handle)
             for sentence in splitter.flush():
-                handles.append(self.send(text=sentence, **params))
+                handle = self._send({**params, "text": sentence}, None, epoch)
+                if handle is None:
+                    return handles
+                handles.append(handle)
         finally:
             if end_input:
                 self.end_input()
@@ -392,12 +432,19 @@ class TTSWebSocket:
             connections = self._core.close()
             readers = list(self._readers)
         self._wake.set()
-        for conn in connections:
-            self._close_transport(conn.transport)
+        # Close every connection at once, and never wait much more than
+        # WS_CLOSE_TIMEOUT for peers that do not answer.
+        closers = [
+            threading.Thread(target=self._close_transport, args=(c.transport,), daemon=True)
+            for c in connections
+        ]
+        for closer in closers:
+            closer.start()
+        deadline = time.monotonic() + WS_CLOSE_TIMEOUT + 0.25
         current = threading.current_thread()
-        for reader in readers:
-            if reader is not current:
-                reader.join(WS_CLOSE_TIMEOUT)
+        for thread in [*closers, *readers]:
+            if thread is not current:
+                thread.join(max(deadline - time.monotonic(), 0.0))
 
     @override
     def __repr__(self) -> str:
@@ -473,36 +520,37 @@ class TTSWebSocket:
                 if mapped is None:
                     raise
                 error, retry_after = mapped
-                if not getattr(error, "retryable", False) or retries >= self._core.max_retries:
-                    raise error from exc
-                retries += 1
-                delay = retry_delay(retries, retry_after)
-                logger.debug(
-                    "WebSocket connect failed (%s); retrying in %.2f s", error.message, delay
+            else:
+                break
+            # Raised outside the except block: the error carries no chained
+            # exception from the WebSocket library.
+            if not getattr(error, "retryable", False) or retries >= self._core.max_retries:
+                raise error
+            retries += 1
+            delay = retry_delay(retries, retry_after)
+            logger.debug("WebSocket connect failed (%s); retrying in %.2f s", error.message, delay)
+            self._client._sleep(delay)
+        logger.debug(
+            "WebSocket connected to %s in %.0f ms",
+            redact_url(url),
+            (time.monotonic() - started) * 1000,
+        )
+        with self._lock:
+            if self._core.closed:
+                closed = True
+            else:
+                closed = False
+                conn = self._core.opened(transport)
+                reader = threading.Thread(
+                    target=self._read, args=(conn,), name="bakbak-ws-reader", daemon=True
                 )
-                self._client._sleep(delay)
-                continue
-            logger.debug(
-                "WebSocket connected to %s in %.0f ms",
-                redact_url(url),
-                (time.monotonic() - started) * 1000,
-            )
-            with self._lock:
-                if self._core.closed:
-                    closed = True
-                else:
-                    closed = False
-                    conn = self._core.opened(transport)
-                    reader = threading.Thread(
-                        target=self._read, args=(conn,), name="bakbak-ws-reader", daemon=True
-                    )
-                    self._readers = [r for r in self._readers if r.is_alive()]
-                    self._readers.append(reader)
-                    reader.start()
-                    self._ensure_watchdog()
-            if closed:
-                self._close_transport(transport)
-            return
+                self._readers = [r for r in self._readers if r.is_alive()]
+                self._readers.append(reader)
+                reader.start()
+                self._ensure_watchdog()
+        if closed:
+            self._close_transport(transport)
+        return
 
     def _flush(self, force_connect: bool = False) -> None:
         """Open a connection if a request needs one, then send what can go."""

@@ -16,7 +16,12 @@ Vocabulary:
   ``pending`` (sorted by send order); its in-flight ones are in ``inflight``,
   all on the connection the context is ``bound`` to.
 - Messages for a context go to its oldest in-flight request: the server runs a
-  context's requests one after another and answers each in order.
+  context's requests one after another and answers each in order. A request
+  that already has its outcome may stay at the head of ``inflight`` (its audio
+  was invalid): the server's remaining messages for it are then dropped.
+- Only *busy* contexts (something unfinished, in flight or being cancelled)
+  are in the routing table, so a long-lived WebSocket does not grow with the
+  number of contexts it has served (§6.6).
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import binascii
 import enum
 import json
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -61,6 +67,7 @@ class Outcome(enum.Enum):
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    WITHDRAWN = "withdrawn"  # its send() was cancelled before it was written
 
 
 class Signal(Protocol):
@@ -88,7 +95,7 @@ class Driver(Protocol):
         ...
 
     def abort(self, connection: Connection) -> None:
-        """Close a connection from the client side."""
+        """Close a connection from the client side (code 1000)."""
         ...
 
     def notice(self, error: APIStatusError) -> None:
@@ -99,13 +106,14 @@ class Driver(Protocol):
 class Connection:
     """One WebSocket connection."""
 
-    __slots__ = ("closed", "draining", "id", "opened_at", "received", "transport")
+    __slots__ = ("closed", "closing", "draining", "id", "opened_at", "received", "transport")
 
     def __init__(self, conn_id: int, transport: Any, opened_at: float) -> None:
         self.id = conn_id
         self.transport: Any = transport
         self.opened_at = opened_at
         self.draining = False
+        self.closing = False  # the client asked to close it
         self.closed = False
         self.received = False
 
@@ -121,6 +129,7 @@ class Request:
         "audio_bytes",
         "conn",
         "context",
+        "drained",
         "error",
         "had_audio",
         "handle",
@@ -146,6 +155,7 @@ class Request:
         self.had_audio = False
         self.request_id: str | None = None
         self.retries = 0
+        self.drained = False  # a draining connection refused it once already
         self.outcome: Outcome | None = None
         self.error: BakbakError | None = None
         self.queued_events = 0
@@ -156,8 +166,10 @@ class Context:
     """One context, as the core tracks it."""
 
     __slots__ = (
+        "__weakref__",
         "bound",
         "cancel_conn",
+        "cancel_epoch",
         "cancel_signal",
         "cancels_pending",
         "events",
@@ -179,6 +191,7 @@ class Context:
         self.bound: Connection | None = None
         self.cancels_pending = 0
         self.cancel_conn: Connection | None = None
+        self.cancel_epoch = 0  # bumped by every cancel(): stops a send_stream feeding it
         self.events: deque[tuple[Request, Any]] = deque()
         self.input_ended = False
         self.last_activity = 0.0
@@ -186,7 +199,7 @@ class Context:
 
     @property
     def busy(self) -> bool:
-        return self.unfinished > 0 or self.cancels_pending > 0
+        return self.unfinished > 0 or self.cancels_pending > 0 or bool(self.inflight)
 
 
 def _insert_in_order(pending: deque[Request], request: Request) -> None:
@@ -198,12 +211,10 @@ def _insert_in_order(pending: deque[Request], request: Request) -> None:
     pending.append(request)
 
 
-def _is_draining(message: dict[str, object] | Any) -> bool:
-    error_code = message.get("error_code")
-    text = message.get("message")
-    return error_code == "service_unavailable" or (
-        isinstance(text, str) and _DRAINING_PHRASE in text
-    )
+def _is_draining(status: int | None, message: object) -> bool:
+    """A draining refusal: 503 and the reconnect phrase. ``error_code`` alone
+    never is: ``service_unavailable`` also means billing is down (§6.4)."""
+    return status == 503 and isinstance(message, str) and _DRAINING_PHRASE in message
 
 
 class Core:
@@ -221,7 +232,10 @@ class Core:
         self.max_retries = max_retries
         self.read_timeout = read_timeout
         self.clock = clock
+        # The routing table: busy contexts only. Every live context, busy or
+        # not, can still be found by id while its owner holds it.
         self.contexts: dict[str, Context] = {}
+        self._known: weakref.WeakValueDictionary[str, Context] = weakref.WeakValueDictionary()
         self.connections: list[Connection] = []
         self.current: Connection | None = None
         self.unfinished = 0
@@ -234,10 +248,10 @@ class Core:
     # Contexts and capacity
 
     def context(self, context_id: str) -> Context:
-        ctx = self.contexts.get(context_id)
+        ctx = self._known.get(context_id)
         if ctx is None:
             ctx = Context(context_id, self.driver.new_signal(), self.driver.new_signal())
-            self.contexts[context_id] = ctx
+            self._known[context_id] = ctx
         return ctx
 
     def at_capacity(self, ctx: Context) -> bool:
@@ -257,15 +271,32 @@ class Core:
         ctx.pending.append(request)
         ctx.unfinished += 1
         self.unfinished += 1
+        self.contexts[ctx.id] = ctx
         return request
+
+    def withdraw(self, request: Request) -> bool:
+        """Take back a request whose ``send()`` was abandoned, if it was not
+        written yet. Its caller never got a handle: no event is emitted."""
+        if request.state is not State.QUEUED:
+            return False
+        ctx = request.context
+        ctx.pending.remove(request)
+        request.state = State.DONE
+        request.outcome = Outcome.WITHDRAWN
+        ctx.unfinished -= 1
+        self.unfinished -= 1
+        request.signal.notify()
+        ctx.signal.notify()
+        self.capacity.notify()
+        self._forget_if_idle(ctx)
+        return True
 
     def end_input(self, ctx: Context) -> None:
         ctx.input_ended = True
         ctx.signal.notify()
-        self._forget_if_idle(ctx)
 
     def _forget_if_idle(self, ctx: Context) -> None:
-        if ctx.input_ended and not ctx.busy and self.contexts.get(ctx.id) is ctx:
+        if not ctx.busy and self.contexts.get(ctx.id) is ctx:
             del self.contexts[ctx.id]
 
     # Sending
@@ -299,7 +330,8 @@ class Core:
 
     def take_sendable(self) -> list[tuple[Connection, str]]:
         """Mark every request that may be sent now as in flight on the current
-        connection, and return the messages, in send order."""
+        connection, and return the messages, in send order. The driver must
+        write all of them (it shields the writes from cancellation)."""
         conn = self.current
         if self.closed or conn is None or conn.closed or conn.draining:
             return []
@@ -355,7 +387,7 @@ class Core:
             if kind == "error" and context_id is None:
                 self.driver.notice(make_status_error(event_status(message), dict(message)))
             else:
-                logger.debug("dropping a %s message for an unknown context", kind)
+                logger.debug("dropping a %s message for a context with nothing in flight", kind)
             return
         ctx.last_activity = self.clock()
         if kind == "cancelled":
@@ -367,6 +399,11 @@ class Core:
             logger.debug("dropping a %s message with no request in flight", kind)
             return
         request = ctx.inflight[0]
+        if request.state is State.DONE:
+            # It already failed (invalid audio); drop the rest of its stream.
+            if kind in ("done", "error"):
+                self._pop_inflight(ctx)
+            return
         request_id = message.get("request_id")
         if isinstance(request_id, str) and request_id:
             request.request_id = request_id
@@ -382,7 +419,9 @@ class Core:
         try:
             raw = decode_audio(message)
         except (binascii.Error, ValueError):
-            self._pop_inflight(ctx)
+            # The stream broke here (§6.4): fail the request now, and keep it
+            # at the head of the context until its stream ends, so its other
+            # messages are not taken for the next request's.
             self._finish(
                 request,
                 Outcome.FAILED,
@@ -414,31 +453,47 @@ class Core:
             )
             return
         error = make_status_error(event_status(message), message)
-        if error.status == 503 and _is_draining(message):
-            # Never retry it here. Hold it (and, through ordering, everything
-            # after it in its context) until the context has nothing left on
-            # this connection, then send it on a new one (§6.4).
-            logger.debug("connection %d is draining; holding a request", conn.id)
+        if _is_draining(error.status, message.get("message")):
+            # Stop sending here; new requests go to a new connection.
+            logger.debug("connection %d is draining", conn.id)
             conn.draining = True
             if self.current is conn:
                 self.current = None
-            request.state = State.HELD
-            request.conn = conn
-            _insert_in_order(ctx.pending, request)
-            if ctx.bound is None:
-                self._release_held(ctx)
+            if not request.drained:
+                # Hold it (and, through ordering, everything after it in its
+                # context) until the context has nothing left on this
+                # connection, then resend it on a new one. No retry is spent.
+                request.drained = True
+                request.state = State.HELD
+                request.conn = conn
+                _insert_in_order(ctx.pending, request)
+                if ctx.bound is None:
+                    self._release_held(ctx)
+                self._close_if_drained(conn)
+                return
+            # Refused while draining a second time: an ordinary retryable
+            # error, resent on a new connection. Later requests of a draining
+            # connection are refused too, so this keeps the context's order.
+            self._close_if_drained(conn)
+            if request.retries < self.max_retries:
+                self._back_off(request, error)
+                return
+            self._finish(request, Outcome.FAILED, error)
             return
         if error.retryable and not ctx.inflight and request.retries < self.max_retries:
             # Nothing later of this context was sent, so resending keeps order.
-            request.retries += 1
-            request.state = State.BACKOFF
-            request.conn = None
-            _insert_in_order(ctx.pending, request)
-            delay = backoff_delay(request.retries)
-            logger.debug("retrying a request in %.2f s after: %s", delay, error.message)
-            self.driver.schedule_retry(request, delay)
+            self._back_off(request, error)
             return
         self._finish(request, Outcome.FAILED, error)
+
+    def _back_off(self, request: Request, error: APIStatusError) -> None:
+        request.retries += 1
+        request.state = State.BACKOFF
+        request.conn = None
+        _insert_in_order(request.context.pending, request)
+        delay = backoff_delay(request.retries)
+        logger.debug("retrying a request in %.2f s after: %s", delay, error.message)
+        self.driver.schedule_retry(request, delay)
 
     def _pop_inflight(self, ctx: Context) -> None:
         conn = ctx.bound
@@ -448,6 +503,8 @@ class Core:
         ctx.bound = None
         if conn is not None and conn.draining:
             self._release_held(ctx)
+            self._close_if_drained(conn)
+        self._forget_if_idle(ctx)
 
     def _release_held(self, ctx: Context) -> None:
         """``ctx`` has nothing left on a draining connection: what it holds,
@@ -459,6 +516,16 @@ class Core:
                 request.conn = None
         if self._waiting_for_connection(ctx):
             self.driver.schedule_flush()
+
+    def _close_if_drained(self, conn: Connection) -> None:
+        """Close a draining connection once no context needs it any more,
+        rather than wait for the server (§6.4)."""
+        if conn.closed or conn.closing or not conn.draining:
+            return
+        if any(c.bound is conn or c.cancel_conn is conn for c in self.contexts.values()):
+            return
+        conn.closing = True
+        self.driver.abort(conn)
 
     def retry_due(self, request: Request) -> None:
         if request.state is State.BACKOFF:
@@ -488,11 +555,15 @@ class Core:
             self._fail_all(error)
             return
         resend = 0
+        unfinished = False
         for ctx in list(self.contexts.values()):
             if ctx.cancel_conn is conn:
                 self._settle_cancels(ctx)
             if ctx.bound is conn:
                 for request in list(ctx.inflight):
+                    if request.state is State.DONE:
+                        continue  # already failed; its stream is gone with the connection
+                    unfinished = True
                     if request.had_audio:
                         self._finish(
                             request,
@@ -516,12 +587,18 @@ class Core:
                     request.state = State.QUEUED
                     request.conn = None
                     resend += 1
-        if code == 1001 or conn.draining:
-            # Going away: reconnect at once and resend; this costs no retry.
+            self._forget_if_idle(ctx)
+        # Going away (1001), a draining connection, or a 1000 that arrives with
+        # work unfinished: reconnect at once and resend; this costs no retry.
+        if code == 1001 or conn.draining or conn.closing or (code == 1000 and unfinished):
             self.driver.schedule_reconnect(0.0, force=code == 1001)
             return
         if resend == 0:
-            return  # an idle close (1000) or nothing to resend: reconnect lazily
+            # Nothing was in flight here, but requests may be waiting for a
+            # connection (queued behind a cancel this close just settled).
+            if self.needs_connection():
+                self.driver.schedule_reconnect(0.0, force=False)
+            return
         healthy = conn.received or self.clock() - conn.opened_at >= WS_HEALTHY_AFTER
         self.failures = 0 if healthy else self.failures + 1
         if self.failures > self.max_retries:
@@ -547,6 +624,7 @@ class Core:
             self._settle_cancels(ctx)
             for request in requests:
                 self._finish(request, Outcome.FAILED, error)
+            self._forget_if_idle(ctx)
 
     def close(self) -> list[Connection]:
         """The user closed the WebSocket: fail what is unfinished and return
@@ -559,8 +637,9 @@ class Core:
             )
         )
         self.closed = True
-        for ctx in list(self.contexts.values()):
+        for ctx in list(self._known.values()):
             ctx.signal.notify()
+            ctx.cancel_signal.notify()
         self.capacity.notify()
         conns = list(self.connections)
         self.current = None
@@ -569,10 +648,12 @@ class Core:
     # Cancelling
 
     def cancel(self, ctx: Context) -> Connection | None:
-        """End every unfinished request of ``ctx`` as cancelled, and discard
-        its audio that has not been handed out yet: a cancel means silence now
-        (§6.3). Returns the connection to send the cancel message on, or
-        ``None`` if nothing on the server needs cancelling."""
+        """End every unfinished request of ``ctx`` as cancelled, discard all
+        of its audio not handed out yet, and stop a ``send_stream`` feeding
+        it: a cancel means silence now (§6.3). Returns the connection to send
+        the cancel message on, or ``None`` if nothing on the server needs
+        cancelling."""
+        ctx.cancel_epoch += 1
         self._discard_queued_audio(ctx)
         conn = ctx.bound
         requests = sorted([*ctx.inflight, *ctx.pending], key=lambda r: r.seq)
@@ -582,11 +663,14 @@ class Core:
         ctx.bound = None
         for request in requests:
             self._finish(request, Outcome.CANCELLED)
+        ctx.signal.notify()
         if not had_inflight or conn is None or conn.closed:
+            self._forget_if_idle(ctx)
             return None
         ctx.cancels_pending += 1
         ctx.cancel_conn = conn
         ctx.last_activity = self.clock()
+        self.contexts[ctx.id] = ctx  # busy until the acknowledgement
         return conn
 
     @staticmethod
@@ -609,13 +693,20 @@ class Core:
         ctx.cancels_pending -= 1
         if not ctx.cancels_pending:
             self._settle_cancels(ctx)
-            self.driver.schedule_flush()
 
     def _settle_cancels(self, ctx: Context) -> None:
+        """The cancel is acknowledged, or its connection is gone. Requests the
+        context queued meanwhile go out now: a new connection is opened if
+        needed, so nothing waits behind a cancel that will never be answered."""
+        conn = ctx.cancel_conn
         ctx.cancels_pending = 0
         ctx.cancel_conn = None
         ctx.cancel_signal.notify()
         self.capacity.notify()
+        if self._waiting_for_connection(ctx):
+            self.driver.schedule_flush()
+        if conn is not None:
+            self._close_if_drained(conn)
         self._forget_if_idle(ctx)
 
     # Read timeouts
@@ -640,7 +731,8 @@ class Core:
                 # The server did not acknowledge a cancel: the connection is
                 # unusable for this context. Close it; the close handling
                 # resends or fails what other contexts had on it.
-                if ctx.cancel_conn is not None:
+                if ctx.cancel_conn is not None and not ctx.cancel_conn.closing:
+                    ctx.cancel_conn.closing = True
                     self.driver.abort(ctx.cancel_conn)
                 continue
             conn = ctx.bound
@@ -662,6 +754,8 @@ class Core:
                 ctx.cancels_pending += 1
                 ctx.cancel_conn = conn
                 sends.append((conn, self.cancel_message(ctx)))
+            else:
+                self._forget_if_idle(ctx)
             soonest = now + self.read_timeout if soonest is None else soonest
         return (None if soonest is None else max(soonest - now, 0.0)), sends
 
