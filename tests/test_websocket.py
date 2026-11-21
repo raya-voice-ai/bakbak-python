@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import re
 import threading
 import time
@@ -377,3 +378,29 @@ def test_events_are_typed_for_each_client() -> None:
     assert Chunk(b"x", "h").request == "h"
     assert Done("h").request == "h"
     assert "1 bytes" in repr(Chunk(b"x", "h"))
+
+
+async def test_debug_logs_never_hold_the_key_or_the_text(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    key, text = "sk-live-0123456789-secret", "गोपनीय वाक्य।"
+    script = [
+        {"recv": {"text": text}},
+        _chunk("c1", b"\x01"),
+        _done("c1"),
+        {"expect_no_more": True},
+    ]
+    with MockWSServer([{"expect_headers": {"x-api-key": key}, "script": script}]) as server:
+        client = AsyncBakbak(api_key=key, base_url=server.base_url)
+        async with client.tts.websocket(**DEFAULTS) as ws:
+            await (await ws.context("c1").send(text=text)).result(timeout=5)
+        await client.close()
+        server.assert_complete(1)
+    ours = [r for r in caplog.records if r.name.startswith("bakbak")]
+    assert any(
+        r.name == "bakbak.websockets" for r in ours
+    )  # the library's log is routed through ours
+    for record in ours:
+        message = record.getMessage()
+        assert key not in message
+        assert text not in message
+        assert "\\u0917" not in message  # nor the text escaped

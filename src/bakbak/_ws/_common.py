@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import secrets
 from collections.abc import Mapping, Sequence
 from typing import cast
 
 from websockets.exceptions import InvalidStatus, InvalidURI, WebSocketException
+from websockets.frames import Frame
 
 from .._exceptions import (
     APIConnectionError,
@@ -21,6 +23,7 @@ from .._exceptions import (
 from ..audio import stream_sample_size
 
 __all__ = [
+    "WEBSOCKET_LOGGER",
     "build_request",
     "check_context_id",
     "connect_error",
@@ -29,6 +32,26 @@ __all__ = [
 ]
 
 _CONTEXT_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
+class _Redact(logging.Filter):
+    """Keeps the key and the synthesis text out of the websockets library's
+    debug log: it logs every handshake header and every frame."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and args:
+            first: object = args[0]
+            if isinstance(first, Frame):
+                record.args = (f"{first.opcode.name} frame ({len(first.data)} bytes)", *args[1:])
+            elif len(args) == 2 and isinstance(first, str) and first.lower() == "x-api-key":
+                record.args = (first, "***")
+        return True
+
+
+WEBSOCKET_LOGGER = logging.getLogger("bakbak.websockets")
+"""The logger the websockets library writes to for this SDK's connections."""
+WEBSOCKET_LOGGER.addFilter(_Redact())
 
 
 def new_context_id() -> str:

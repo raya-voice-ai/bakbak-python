@@ -26,7 +26,13 @@ from .._retry import retry_delay
 from .._utils import logger, redact_url, user_agent
 from ..text import Segmenter
 from ..types import RequestDefaults, SendParams
-from ._common import build_request, check_context_id, connect_error, text_delta
+from ._common import (
+    WEBSOCKET_LOGGER,
+    build_request,
+    check_context_id,
+    connect_error,
+    text_delta,
+)
 from ._core import Connection, Core, Outcome, Request, State
 from .events import Chunk, Failed, RequestResult, WebSocketEvent
 
@@ -433,6 +439,7 @@ class AsyncTTSWebSocket:
                     open_timeout=self._client.timeout.connect,
                     close_timeout=WS_CLOSE_TIMEOUT,
                     max_size=WS_MAX_MESSAGE_BYTES,
+                    logger=WEBSOCKET_LOGGER,
                 )
             except Exception as exc:
                 mapped = connect_error(exc)
