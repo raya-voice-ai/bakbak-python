@@ -40,10 +40,12 @@ The same with asyncio:
 import asyncio
 from bakbak import AsyncBakbak
 
+
 async def main() -> None:
     async with AsyncBakbak() as client:
         audio = await client.tts.generate(text="नमस्ते!", voice_id="…", language="hi", model="m1")
         audio.save("hello.wav")
+
 
 asyncio.run(main())
 ```
@@ -56,12 +58,12 @@ Every example in [`examples/`](examples) runs as is with `BAKBAK_API_KEY` set.
 from bakbak import Bakbak, Timeout
 
 client = Bakbak(
-    api_key="…",                                  # default: BAKBAK_API_KEY
-    base_url="https://hub.getraya.app",           # default: BAKBAK_BASE_URL, then this
+    api_key="…",  # default: BAKBAK_API_KEY
+    base_url="https://hub.getraya.app",  # default: BAKBAK_BASE_URL, then this
     timeout=Timeout(connect=5, read=60, total=None),
     max_retries=2,
     default_headers={"X-Team": "voice"},
-    http_client=None,                             # your own httpx.Client, e.g. with a proxy
+    http_client=None,  # your own httpx.Client, e.g. with a proxy
 )
 ```
 
@@ -90,15 +92,15 @@ audio = client.tts.generate(
     voice_id=voice_id,
     language="hi",
     model="m1",
-    speed=1.1,                                                     # 0.5 to 1.5
+    speed=1.1,  # 0.5 to 1.5
     output_format={"container": "wav", "encoding": "pcm_s16le", "sample_rate": 24000},
 )
-audio.data          # bytes, exactly as received
-audio.request_id    # quote it to support
+audio.data  # bytes, exactly as received
+audio.request_id  # quote it to support
 audio.content_type  # audio/wav, audio/mpeg, audio/pcm, audio/basic, application/octet-stream
-audio.encoding, audio.sample_rate   # from X-Audio-Format / X-Audio-Sample-Rate
+audio.encoding, audio.sample_rate  # from X-Audio-Format / X-Audio-Sample-Rate
 audio.save("out.wav")
-audio.to_wav()      # WAV bytes; raw PCM, mu-law and A-law get a header
+audio.to_wav()  # WAV bytes; raw PCM, mu-law and A-law get a header
 ```
 
 `output_format`:
@@ -123,7 +125,7 @@ with client.tts.stream(
     model="m1",
     output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": 24000},
 ) as stream:
-    for chunk in stream:          # AudioChunk(audio, step_time, request_id)
+    for chunk in stream:  # AudioChunk(audio, step_time, request_id)
         player.write(chunk.audio)
 print(stream.request_id, stream.audio_bytes)
 ```
@@ -142,14 +144,16 @@ first audio and the one to use for voice agents.
 
 ```python
 async with client.tts.websocket(
-    voice_id=voice_id, language="hi", model="m1",
+    voice_id=voice_id,
+    language="hi",
+    model="m1",
     output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": 16000},
-) as ws:                                    # opens the socket now (prewarm)
-    ctx = ws.context()                      # requests on a context play in order
+) as ws:  # opens the socket now (prewarm)
+    ctx = ws.context()  # requests on a context play in order
     await ctx.send(text="पहला वाक्य।")
     await ctx.send(text="दूसरा वाक्य।")
     ctx.end_input()
-    async for audio in ctx.audio():         # bytes, in order; raises the first failure
+    async for audio in ctx.audio():  # bytes, in order; raises the first failure
         player.write(audio)
 ```
 
@@ -216,7 +220,7 @@ See [`examples/llm_streaming.py`](examples/llm_streaming.py).
 ## Voices
 
 ```python
-voices = client.voices.list(model="m1", language="hi")   # filtered by the SDK
+voices = client.voices.list(model="m1", language="hi")  # filtered by the SDK
 for voice in voices:
     print(voice.id, voice.name, voice.language, voice.model)
 ```
@@ -233,7 +237,7 @@ from bakbak.text import Segmenter, split_sentences
 split_sentences("Dr. Rao will call at 5 p.m. today. Please stay on the line.")
 # ['Dr. Rao will call at 5 p.m. today.', 'Please stay on the line.']
 
-segmenter = Segmenter(eager_first_clause=True)   # first audio sooner on a long first sentence
+segmenter = Segmenter(eager_first_clause=True)  # first audio sooner on a long first sentence
 for token in tokens:
     for sentence in segmenter.push(token):
         ...
@@ -350,6 +354,7 @@ statuses, timings and sizes. It never logs the API key or any text.
 
 ```python
 import logging
+
 logging.basicConfig()
 logging.getLogger("bakbak").setLevel(logging.DEBUG)
 ```

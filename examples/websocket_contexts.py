@@ -40,12 +40,15 @@ async def speak(ctx: AsyncContext, sentences: list[str], path: str) -> None:
 
 
 async def main() -> None:
-    async with AsyncBakbak() as client, client.tts.websocket(
-        voice_id=VOICE_ID,
-        language=LANGUAGE,
-        model=MODEL,
-        output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": SAMPLE_RATE},
-    ) as ws:
+    async with (
+        AsyncBakbak() as client,
+        client.tts.websocket(
+            voice_id=VOICE_ID,
+            language=LANGUAGE,
+            model=MODEL,
+            output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": SAMPLE_RATE},
+        ) as ws,
+    ):
         await asyncio.gather(
             speak(
                 ws.context("caller-1"),

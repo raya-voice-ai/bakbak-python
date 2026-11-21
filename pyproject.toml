@@ -77,6 +77,8 @@ filterwarnings = ["error"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# A synced copy of the shared specification: never linted or reformatted here.
+extend-exclude = ["conformance"]
 
 [tool.ruff.lint]
 select = [
