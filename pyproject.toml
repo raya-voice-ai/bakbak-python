@@ -91,7 +91,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "PT011", "ASYNC", "B023"]  # B023: wait helpers call their lambdas at once
-"examples/**" = ["S"]
+"examples/**" = ["S", "ASYNC230"]  # each example writes one small file at the end
 
 [tool.ruff.lint.isort]
 known-first-party = ["bakbak"]
