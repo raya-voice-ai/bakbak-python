@@ -9,7 +9,10 @@
       "prerelease": true,
       "prerelease-type": "rc",
       "versioning": "prerelease",
-      "extra-files": ["src/bakbak/_version.py"]
+      "extra-files": [
+        "src/bakbak/_version.py"
+      ],
+      "include-component-in-tag": false
     }
   }
 }

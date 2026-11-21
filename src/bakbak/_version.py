@@ -1,2 +1,3 @@
 __title__ = "bakbak-python"
-__version__ = "1.0.0rc1"  # x-release-please-version
+# release-please writes "1.0.0-rc.N"; PEP 440 reads it as 1.0.0rcN.
+__version__ = "1.0.0-rc.1"  # x-release-please-version
