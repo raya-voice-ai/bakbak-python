@@ -31,6 +31,7 @@ from ._common import (
     build_request,
     check_context_id,
     connect_error,
+    open_failure,
     text_delta,
 )
 from ._core import Connection, Core, Outcome, Request, State
@@ -479,8 +480,8 @@ class AsyncTTSWebSocket:
                 if needed():
                     try:
                         await self._open()
-                    except BakbakError as error:
-                        core.fail_waiting(error)
+                    except Exception as exc:
+                        core.fail_waiting(open_failure(exc))
                         return
         async with self._send_lock:
             for conn, wire in core.take_sendable():

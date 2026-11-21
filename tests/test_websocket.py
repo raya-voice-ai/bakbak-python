@@ -404,3 +404,21 @@ async def test_debug_logs_never_hold_the_key_or_the_text(caplog: pytest.LogCaptu
         assert key not in message
         assert text not in message
         assert "\\u0917" not in message  # nor the text escaped
+
+
+async def test_an_unexpected_connect_failure_still_gives_an_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import bakbak._ws._async as driver
+
+    async def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(driver, "connect", broken)
+    client = AsyncBakbak(api_key="test-key", base_url="http://localhost:9")
+    ws = client.tts.websocket(**DEFAULTS)
+    handle = await ws.context().send(text="Hello.")
+    with pytest.raises(bakbak.APIConnectionError, match="RuntimeError: boom"):
+        await handle.result(timeout=5)
+    await ws.close()
+    await client.close()

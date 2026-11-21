@@ -20,6 +20,7 @@ from .._exceptions import (
     BakbakError,
     make_status_error,
 )
+from .._utils import logger
 from ..audio import stream_sample_size
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "check_context_id",
     "connect_error",
     "new_context_id",
+    "open_failure",
     "text_delta",
 ]
 
@@ -160,3 +162,15 @@ def connect_error(exc: BaseException) -> tuple[BakbakError, str | None] | None:
     if isinstance(exc, (OSError, WebSocketException)):
         return APIConnectionError(f"Could not open the WebSocket: {type(exc).__name__}."), None
     return None
+
+
+def open_failure(exc: BaseException) -> BakbakError:
+    """What a request waiting for a connection fails with when opening one
+    raised ``exc``: the SDK error itself, or a connection error that names
+    an unexpected one (every waiting request must get an outcome)."""
+    if isinstance(exc, BakbakError):
+        return exc
+    logger.debug("opening the WebSocket raised an unexpected error", exc_info=exc)
+    return APIConnectionError(
+        f"Could not open the WebSocket: {type(exc).__name__}: {exc}", retryable=False
+    )

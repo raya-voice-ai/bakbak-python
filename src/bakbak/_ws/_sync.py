@@ -33,6 +33,7 @@ from ._common import (
     build_request,
     check_context_id,
     connect_error,
+    open_failure,
     text_delta,
 )
 from ._core import Connection, Core, Outcome, Request, State
@@ -520,9 +521,9 @@ class TTSWebSocket:
                 if needed():
                     try:
                         self._open()
-                    except BakbakError as error:
+                    except Exception as exc:
                         with self._lock:
-                            core.fail_waiting(error)
+                            core.fail_waiting(open_failure(exc))
                         return
         with self._send_lock:
             with self._lock:
