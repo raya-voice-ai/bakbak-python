@@ -387,3 +387,122 @@ async def test_async_stream_and_prewarm() -> None:
             )
             assert await raw.parse().read() == b"\x01\x02"
         server.assert_complete()
+
+
+# Review regressions: redirects, invalid base64, error chains, key checks
+
+
+def test_http_never_follows_redirects() -> None:
+    moved = {
+        "status": 302,
+        "headers": {"location": "http://localhost:1/elsewhere"},
+        "body_base64": "",
+    }
+    with MockHTTPServer([_exchange(moved)]) as server:
+        follower = httpx.Client(follow_redirects=True)  # even a caller's client that would
+        client = Bakbak(api_key=KEY, base_url=server.base_url, http_client=follower)
+        with pytest.raises(bakbak.APIStatusError) as info:
+            client.tts.generate(**PARAMS)
+        server.assert_complete()  # one attempt: not retried, not followed
+        follower.close()
+    assert type(info.value) is bakbak.APIStatusError
+    assert info.value.status == 302
+    assert info.value.retryable is False
+
+
+def test_sse_invalid_base64_before_audio_is_retried() -> None:
+    bad = {"type": "chunk", "data": "abc"}
+    exchanges = [
+        _exchange(
+            {"status": 200, "headers": {"x-request-id": "r1"}, "sse": _sse(bad, DONE)},
+            "/v1/text-to-speech/stream",
+        ),
+        _exchange(
+            {"status": 200, "headers": {"x-request-id": "r2"}, "sse": _sse(_chunk(b"abcd"), DONE)},
+            "/v1/text-to-speech/stream",
+        ),
+    ]
+    with MockHTTPServer(exchanges) as server:
+        client = Bakbak(api_key=KEY, base_url=server.base_url)
+        client._sleep = lambda seconds: None
+        with client.tts.stream(**PARAMS) as stream:
+            assert stream.read() == b"abcd"
+        server.assert_complete()
+
+
+def test_sse_invalid_base64_after_audio_is_interrupted() -> None:
+    sse = _sse(_chunk(b"abcd"), {"type": "chunk", "data": "abc"}, DONE)
+    exchange = _exchange(
+        {"status": 200, "headers": {"x-request-id": "r1"}, "sse": sse}, "/v1/text-to-speech/stream"
+    )
+    with MockHTTPServer([exchange]) as server:
+        client = Bakbak(api_key=KEY, base_url=server.base_url)
+        with pytest.raises(bakbak.StreamInterruptedError) as info:
+            client.tts.stream(**PARAMS).read()
+    assert info.value.audio_bytes == 4
+    assert info.value.request_id == "r1"
+
+
+def _chain(error: BaseException) -> list[BaseException]:
+    seen: list[BaseException] = []
+    pending: list[BaseException | None] = [error]
+    while pending:
+        item = pending.pop()
+        if item is None or any(item is s for s in seen):
+            continue
+        seen.append(item)
+        pending += [item.__cause__, item.__context__]
+    return seen
+
+
+def _assert_no_key_reachable(error: BaseException) -> None:
+    for item in _chain(error):
+        assert not isinstance(item, httpx.HTTPError), f"{type(item).__name__} in the chain"
+        assert getattr(item, "request", None) is None
+        for text in (repr(item), str(item), *map(repr, vars(item).values())):
+            assert KEY not in text
+
+
+def test_connection_errors_carry_no_request_headers() -> None:
+    with MockHTTPServer([]) as server:
+        url = server.base_url
+    client = Bakbak(api_key=KEY, base_url=url, max_retries=0)  # nothing listens there now
+    with pytest.raises(bakbak.APIConnectionError) as info:
+        client.tts.generate(**PARAMS)
+    _assert_no_key_reachable(info.value)
+    with pytest.raises(bakbak.APIConnectionError) as ws_info:
+        client.tts.websocket().connect()
+    _assert_no_key_reachable(ws_info.value)
+
+
+def test_body_cut_short_carries_no_request_headers() -> None:
+    response = {
+        "status": 200,
+        "headers": {},
+        "body_base64": base64.b64encode(b"x" * 10).decode(),
+        "content_length": 100,
+    }
+    with MockHTTPServer([_exchange(response)]) as server:
+        client = Bakbak(api_key=KEY, base_url=server.base_url)
+        with pytest.raises(bakbak.StreamInterruptedError) as info:
+            client.tts.generate(**PARAMS)
+    _assert_no_key_reachable(info.value)
+
+
+@pytest.mark.parametrize(
+    ("key", "problem"),
+    [
+        ("sk-live 123", "whitespace"),
+        ("sk-live-123\n", "whitespace"),
+        ("sk-live\x00123", "control characters"),
+        ("sk-live-123" + chr(0x2019), "non-ASCII"),
+    ],
+)
+def test_unusable_keys_are_refused_without_echoing_them(key: str, problem: str) -> None:
+    with pytest.raises(bakbak.BakbakError) as info:
+        Bakbak(api_key=key)
+    assert problem in str(info.value)
+    assert "sk-live" not in str(info.value)
+    assert "sk-live" not in repr(info.value)
+    with pytest.raises(bakbak.BakbakError):
+        AsyncBakbak(api_key=key)

@@ -102,14 +102,14 @@ class OpenStream(Generic[RawT]):
     Attributes:
         response: the open response.
         pending: events already parsed and not yet handled, starting with the
-            first audio event.
+            first audio event, each with its audio if already decoded.
         decoder: the SSE decoder, holding any partial event.
         raw: the response's byte iterator, to continue reading from.
         deadline: when the call's total timeout ends, if it has one.
     """
 
     response: httpx.Response
-    pending: deque[Mapping[str, object]]
+    pending: deque[tuple[Mapping[str, object], bytes | None]]
     decoder: SSEDecoder
     raw: RawT
     deadline: float | None
@@ -183,11 +183,24 @@ class _StreamBase:
             raise BakbakError("This stream is closed.")
         self._consumed = True
 
-    def _handle(self, event: Mapping[str, object]) -> AudioChunk | bool:
+    def _handle(
+        self, event: Mapping[str, object], decoded: bytes | None = None
+    ) -> AudioChunk | bool:
         """An ``AudioChunk`` to hand out, ``True`` at the end, ``False`` to skip."""
         kind = event.get("type")
         if kind == "chunk":
-            audio = self._aligner.feed(decode_audio(event))
+            if decoded is None:
+                try:
+                    decoded = decode_audio(event)
+                except (binascii.Error, ValueError):
+                    # The stream breaks here (§6.4 note); never a raw binascii.Error.
+                    raise make_interrupted_error(
+                        None,
+                        audio_bytes=self.audio_bytes,
+                        header_request_id=self.request_id,
+                        default_message="The server sent audio that is not valid base64.",
+                    ) from None
+            audio = self._aligner.feed(decoded)
             if not audio:
                 return False
             self.audio_bytes += len(audio)
@@ -282,11 +295,12 @@ class AudioStream(_StreamBase):
         opened = self._ensure_open()
         try:
             while opened.pending:
-                result = self._handle(opened.pending.popleft())
+                result = self._handle(*opened.pending.popleft())
                 if result is True:
                     return
                 if result is not False:
                     yield result
+            failure: BakbakError | None = None
             try:
                 for raw in opened.raw:
                     for event in parse_events(opened.decoder, raw):
@@ -297,8 +311,10 @@ class AudioStream(_StreamBase):
                             yield result
                     self._check_deadline()
             except (httpx.TimeoutException, httpx.TransportError, httpx.StreamError) as exc:
-                raise self._broken(exc) from exc
-            raise self._truncated()
+                failure = self._broken(exc)
+            # Raised outside the except block, so no httpx exception (which
+            # holds the request headers) is chained to it.
+            raise failure or self._truncated()
         finally:
             self.close()
 
@@ -371,11 +387,12 @@ class AsyncAudioStream(_StreamBase):
         opened = await self._ensure_open()
         try:
             while opened.pending:
-                result = self._handle(opened.pending.popleft())
+                result = self._handle(*opened.pending.popleft())
                 if result is True:
                     return
                 if result is not False:
                     yield result
+            failure: BakbakError | None = None
             try:
                 async for raw in opened.raw:
                     for event in parse_events(opened.decoder, raw):
@@ -386,8 +403,10 @@ class AsyncAudioStream(_StreamBase):
                             yield result
                     self._check_deadline()
             except (httpx.TimeoutException, httpx.TransportError, httpx.StreamError) as exc:
-                raise self._broken(exc) from exc
-            raise self._truncated()
+                failure = self._broken(exc)
+            # Raised outside the except block, so no httpx exception (which
+            # holds the request headers) is chained to it.
+            raise failure or self._truncated()
         finally:
             await self.close()
 

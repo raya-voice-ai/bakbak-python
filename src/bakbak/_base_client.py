@@ -10,6 +10,7 @@ example an SSE ``error`` event that arrives before any audio.
 from __future__ import annotations
 
 import asyncio
+import binascii
 import json
 import os
 import time
@@ -42,7 +43,7 @@ from ._exceptions import (
 from ._models import Audio
 from ._retry import retry_delay
 from ._sse import SSEDecoder
-from ._streaming import OpenStream, parse_events
+from ._streaming import OpenStream, decode_audio, parse_events
 from ._types import NotGiven, Timeout, TimeoutLike, coerce_timeout
 from ._utils import as_mapping, client_header, logger, user_agent, websocket_url
 from .types import Voice
@@ -59,6 +60,19 @@ class CallOptions:
     timeout: Timeout
     max_retries: int
     extra_headers: Mapping[str, str] | None
+
+
+def _key_problem(key: str) -> str | None:
+    """What is wrong with a key that cannot be a header value, if anything."""
+    if not isinstance(key, str):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return "is not a string"
+    if any(ch.isspace() for ch in key):
+        return "contains whitespace"
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in key):
+        return "contains control characters"
+    if not key.isascii():
+        return "contains non-ASCII characters"
+    return None
 
 
 def _check_max_retries(value: int) -> int:
@@ -145,15 +159,29 @@ class _StreamStart:
     def __init__(self, response: httpx.Response) -> None:
         self.response = response
         self.decoder = SSEDecoder()
-        self.pending: deque[Mapping[str, object]] = deque()
+        self.pending: deque[tuple[Mapping[str, object], bytes | None]] = deque()
 
     def feed(self, raw: bytes) -> bool:
         """Parse ``raw``; True once the first audio or ``done`` is pending."""
         events = parse_events(self.decoder, raw)
         for i, event in enumerate(events):
             kind = event.get("type")
-            if (kind == "chunk" and event.get("data")) or kind == "done":
-                self.pending.extend(events[i:])
+            if kind == "chunk" and event.get("data"):
+                try:
+                    audio = decode_audio(event)  # decoded once, here
+                except (binascii.Error, ValueError):
+                    # The stream broke before any audio: retried (§6.4 note).
+                    raise make_interrupted_error(
+                        None,
+                        audio_bytes=0,
+                        header_request_id=self.response.headers.get("x-request-id"),
+                        default_message="The server sent audio that is not valid base64.",
+                    ) from None
+                self.pending.append((event, audio))
+                self.pending.extend((e, None) for e in events[i + 1 :])
+                return True
+            if kind == "done":
+                self.pending.extend((e, None) for e in events[i:])
                 return True
             if kind == "error":
                 raise make_status_error(
@@ -175,9 +203,27 @@ class _StreamStart:
 
 
 def _transport_error(exc: Exception, phase: str) -> APIConnectionError:
+    """The SDK error for an httpx failure. It is raised without its cause:
+    httpx exceptions hold the request, and so the X-API-Key header (§8)."""
     if isinstance(exc, httpx.TimeoutException):
         return APITimeoutError(f"The request timed out {phase}.")
-    return APIConnectionError(f"Connection error {phase}: {type(exc).__name__}.")
+    detail = str(exc)[:200]
+    return APIConnectionError(
+        f"Connection error {phase}: {type(exc).__name__}" + (f": {detail}" if detail else ".")
+    )
+
+
+def _body_failure(exc: Exception, received: int, response: httpx.Response) -> BakbakError:
+    """A whole-file body broke: interrupted after its first byte, else a
+    connection error that can be retried."""
+    if received:
+        return make_interrupted_error(
+            None,
+            audio_bytes=received,
+            header_request_id=response.headers.get("x-request-id"),
+            default_message="The audio ended before it was complete.",
+        )
+    return _transport_error(exc, "before the audio started")
 
 
 def _past(deadline: float | None) -> bool:
@@ -207,6 +253,13 @@ class _BaseClient:
             raise BakbakError(
                 "No API key was found: pass api_key= to the client, or set the "
                 f"{API_KEY_ENV} environment variable."
+            )
+        problem = _key_problem(api_key)
+        if problem:
+            # Never echo the key: it could end up in a log.
+            raise BakbakError(
+                f"The API key {problem}, so it cannot be sent in a header; check for a "
+                "stray space, line break or quote where it was copied."
             )
         if base_url is None:
             base_url = os.environ.get(BASE_URL_ENV) or DEFAULT_BASE_URL
@@ -364,10 +417,11 @@ class SyncAPIClient(_BaseClient):
                     method, url, headers=headers, content=body,
                     timeout=_httpx_timeout(options.timeout, deadline),
                 )  # fmt: skip
-                response = self._client.send(request, stream=True)
+                # Never follow a redirect, even with a caller's http_client:
+                # it would carry X-API-Key to another origin (§8).
+                response = self._client.send(request, stream=True, follow_redirects=False)
             except httpx.HTTPError as exc:
                 error: BakbakError = _transport_error(exc, "before any response")
-                cause: Exception = exc
             else:
                 logger.debug(
                     "%s %s -> %d (request_id %s) in %.0f ms",
@@ -375,7 +429,7 @@ class SyncAPIClient(_BaseClient):
                     response.headers.get("x-request-id"), (time.monotonic() - started) * 1000,
                 )  # fmt: skip
                 try:
-                    if response.status_code >= 400:
+                    if not 200 <= response.status_code < 300:
                         retry_after = response.headers.get("retry-after")
                         try:
                             content = response.read()
@@ -385,15 +439,13 @@ class SyncAPIClient(_BaseClient):
                     return handle(response, deadline), response, retries
                 except (APIStatusError, APIConnectionError, StreamInterruptedError) as exc:
                     response.close()
-                    error, cause = exc, exc
+                    error = exc
                 except BaseException:
                     response.close()
                     raise
             wait = self._next_wait(error, retries, options, deadline, retry_after)
             if wait is None:
-                if error is cause:
-                    raise error
-                raise error from cause
+                raise error
             retries += 1
             logger.debug("retrying %s %s in %.2f s after: %s", method, path, wait, error.message)
             self._sleep(wait)
@@ -404,6 +456,7 @@ class SyncAPIClient(_BaseClient):
     def _read_audio(response: httpx.Response, deadline: float | None) -> Audio:
         parts: list[bytes] = []
         received = 0
+        failure: BakbakError | None = None
         try:
             for piece in response.iter_bytes():
                 parts.append(piece)
@@ -411,16 +464,11 @@ class SyncAPIClient(_BaseClient):
                 if _past(deadline):
                     raise httpx.ReadTimeout("total timeout")
         except httpx.HTTPError as exc:
-            if received:
-                raise make_interrupted_error(
-                    None,
-                    audio_bytes=received,
-                    header_request_id=response.headers.get("x-request-id"),
-                    default_message="The audio ended before it was complete.",
-                ) from exc
-            raise _transport_error(exc, "before the audio started") from exc
+            failure = _body_failure(exc, received, response)
         finally:
             response.close()
+        if failure is not None:
+            raise failure  # outside the except block: no httpx exception in its chain
         return _audio(response, b"".join(parts))
 
     @staticmethod
@@ -429,6 +477,7 @@ class SyncAPIClient(_BaseClient):
     ) -> OpenStream[Iterator[bytes]]:
         start = _StreamStart(response)
         raw = response.iter_bytes()
+        failure: BakbakError | None = None
         try:
             for piece in raw:
                 if start.feed(piece):
@@ -436,15 +485,19 @@ class SyncAPIClient(_BaseClient):
                 if _past(deadline):
                     raise httpx.ReadTimeout("total timeout")
         except httpx.HTTPError as exc:
-            raise _transport_error(exc, "before any audio") from exc
-        raise start.ended()
+            failure = _transport_error(exc, "before any audio")
+        raise failure or start.ended()
 
     @staticmethod
     def _read_voices(response: httpx.Response, deadline: float | None) -> list[Voice]:
+        failure: BakbakError | None = None
+        content = b""
         try:
             content = response.read()
         except httpx.HTTPError as exc:
-            raise _transport_error(exc, "while reading the voice list") from exc
+            failure = _transport_error(exc, "while reading the voice list")
+        if failure is not None:
+            raise failure
         return _voices(response, content)
 
 
@@ -507,10 +560,11 @@ class AsyncAPIClient(_BaseClient):
                     method, url, headers=headers, content=body,
                     timeout=_httpx_timeout(options.timeout, deadline),
                 )  # fmt: skip
-                response = await self._client.send(request, stream=True)
+                # Never follow a redirect, even with a caller's http_client:
+                # it would carry X-API-Key to another origin (§8).
+                response = await self._client.send(request, stream=True, follow_redirects=False)
             except httpx.HTTPError as exc:
                 error: BakbakError = _transport_error(exc, "before any response")
-                cause: Exception = exc
             else:
                 logger.debug(
                     "%s %s -> %d (request_id %s) in %.0f ms",
@@ -518,7 +572,7 @@ class AsyncAPIClient(_BaseClient):
                     response.headers.get("x-request-id"), (time.monotonic() - started) * 1000,
                 )  # fmt: skip
                 try:
-                    if response.status_code >= 400:
+                    if not 200 <= response.status_code < 300:
                         retry_after = response.headers.get("retry-after")
                         try:
                             content = await response.aread()
@@ -528,15 +582,13 @@ class AsyncAPIClient(_BaseClient):
                     return await handle(response, deadline), response, retries
                 except (APIStatusError, APIConnectionError, StreamInterruptedError) as exc:
                     await response.aclose()
-                    error, cause = exc, exc
+                    error = exc
                 except BaseException:
                     await response.aclose()
                     raise
             wait = self._next_wait(error, retries, options, deadline, retry_after)
             if wait is None:
-                if error is cause:
-                    raise error
-                raise error from cause
+                raise error
             retries += 1
             logger.debug("retrying %s %s in %.2f s after: %s", method, path, wait, error.message)
             await self._sleep(wait)
@@ -545,6 +597,7 @@ class AsyncAPIClient(_BaseClient):
     async def _read_audio(response: httpx.Response, deadline: float | None) -> Audio:
         parts: list[bytes] = []
         received = 0
+        failure: BakbakError | None = None
         try:
             async for piece in response.aiter_bytes():
                 parts.append(piece)
@@ -552,16 +605,11 @@ class AsyncAPIClient(_BaseClient):
                 if _past(deadline):
                     raise httpx.ReadTimeout("total timeout")
         except httpx.HTTPError as exc:
-            if received:
-                raise make_interrupted_error(
-                    None,
-                    audio_bytes=received,
-                    header_request_id=response.headers.get("x-request-id"),
-                    default_message="The audio ended before it was complete.",
-                ) from exc
-            raise _transport_error(exc, "before the audio started") from exc
+            failure = _body_failure(exc, received, response)
         finally:
             await response.aclose()
+        if failure is not None:
+            raise failure  # outside the except block: no httpx exception in its chain
         return _audio(response, b"".join(parts))
 
     @staticmethod
@@ -570,6 +618,7 @@ class AsyncAPIClient(_BaseClient):
     ) -> OpenStream[AsyncIterator[bytes]]:
         start = _StreamStart(response)
         raw = response.aiter_bytes()
+        failure: BakbakError | None = None
         try:
             async for piece in raw:
                 if start.feed(piece):
@@ -577,13 +626,17 @@ class AsyncAPIClient(_BaseClient):
                 if _past(deadline):
                     raise httpx.ReadTimeout("total timeout")
         except httpx.HTTPError as exc:
-            raise _transport_error(exc, "before any audio") from exc
-        raise start.ended()
+            failure = _transport_error(exc, "before any audio")
+        raise failure or start.ended()
 
     @staticmethod
     async def _read_voices(response: httpx.Response, deadline: float | None) -> list[Voice]:
+        failure: BakbakError | None = None
+        content = b""
         try:
             content = await response.aread()
         except httpx.HTTPError as exc:
-            raise _transport_error(exc, "while reading the voice list") from exc
+            failure = _transport_error(exc, "while reading the voice list")
+        if failure is not None:
+            raise failure
         return _voices(response, content)
