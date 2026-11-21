@@ -16,7 +16,9 @@ Lengths are counted in Unicode code points.
 
 from __future__ import annotations
 
+import re
 import unicodedata
+from collections.abc import Iterator
 from typing import NamedTuple
 
 __all__ = ["MAX_CHARS_LIMIT", "Segmenter", "split_sentences"]
@@ -67,6 +69,34 @@ _AMBIGUOUS = frozenset(
         "sept", "oct", "nov", "dec",
     }
 )  # fmt: skip
+
+
+_SPECIAL = re.compile("[\n" + "".join(re.escape(c) for c in sorted(_TERMINATORS)) + "]")
+_SPECIAL_CLAUSE = re.compile(
+    "[\n" + "".join(re.escape(c) for c in sorted(_TERMINATORS | _SOFT_DELIMITERS)) + "]"
+)
+
+
+class _NextSpecial:
+    """Finds the next character that can start a candidate (a newline, a
+    terminator, or with ``clause`` a soft delimiter), remembering its last
+    answer: the wrap path asks again from a later start many times, and without
+    the memo a long text with no punctuation would be scanned once per piece."""
+
+    __slots__ = ("memo", "text")
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.memo: dict[bool, tuple[int, int]] = {}
+
+    def __call__(self, i: int, clause: bool) -> int:
+        lo, at = self.memo.get(clause, (-1, -1))
+        if lo <= i <= at:
+            return at
+        match = (_SPECIAL_CLAUSE if clause else _SPECIAL).search(self.text, i)
+        at = match.start() if match else len(self.text)
+        self.memo[clause] = (i, at)
+        return at
 
 
 def _speakable(s: str) -> bool:
@@ -131,24 +161,28 @@ class _Candidate(NamedTuple):
 
 
 def _candidates(
-    text: str, start: int, final: bool, clause: tuple[int, int] | None
-) -> list[_Candidate]:
-    """Boundary candidates in ``text[start:]``, in order.
+    text: str, start: int, final: bool, clause: tuple[int, int] | None, nxt: _NextSpecial
+) -> Iterator[_Candidate]:
+    """Boundary candidates in ``text[start:]``, in order, produced lazily:
+    callers stop at the first one that ends a group, which keeps segmentation
+    linear in the length of the text.
 
     ``clause``, when given, is ``(group_start, first_clause_min_chars)``: soft
     delimiters followed by whitespace also count, if the stripped text from the
     group start through the delimiter is long enough.
     """
-    out: list[_Candidate] = []
     n = len(text)
     i = start
     while i < n:
+        i = nxt(i, clause is not None)  # skip ordinary characters
+        if i >= n:
+            break
         ch = text[i]
         if ch == "\n":
             j = i
             while j < n and text[j] in _WHITESPACE:
                 j += 1
-            out.append(_Candidate(i, final or j < n, True))
+            yield _Candidate(i, final or j < n, True)
             i = j
             continue
         is_clause = (
@@ -174,7 +208,7 @@ def _candidates(
             # Nothing after the run yet: undecided unless final (and the end of
             # the text is a boundary anyway).
             if not final:
-                out.append(_Candidate(end, False, False))
+                yield _Candidate(end, False, False)
             break
         if text[j] not in _WHITESPACE:
             i = j  # "3.14", "a.com", "है।राहुल": not a candidate
@@ -183,7 +217,7 @@ def _candidates(
         while k < n and text[k] in _WHITESPACE:
             k += 1
         if k >= n and not final:
-            out.append(_Candidate(end, False, False))
+            yield _Candidate(end, False, False)
             break
         next_char = text[k] if k < n else ""
         boundary = True
@@ -197,9 +231,8 @@ def _candidates(
                 or (lowered in _AMBIGUOUS and not ("A" <= next_char <= "Z"))
             ):
                 boundary = False
-        out.append(_Candidate(end, True, boundary))
+        yield _Candidate(end, True, boundary)
         i = k
-    return out
 
 
 def _wrap_cut(text: str, start: int, max_chars: int) -> int:
@@ -226,20 +259,28 @@ def _wrap_cut(text: str, start: int, max_chars: int) -> int:
     return cut if cut > start + 1 else window_end
 
 
+# The longest word a full-stop rule looks at: a title, an ambiguous
+# abbreviation, or 1-3 digits. A longer word never matches any rule.
+_LONGEST_RULE_WORD = max(3, *(len(w) for w in _TITLES | _AMBIGUOUS))
+
+
 def _keep_from(text: str, gs: int) -> int:
     """Where the buffer can be trimmed when the pending text starts at ``gs``.
 
     The boundary rules look behind a full stop: at the word before it, and at
-    whether that word starts a line. The reference trims the buffer at ``gs``,
-    which loses that context and breaks the streaming invariant in rare cases
-    (a list marker such as "1." right after an emitted sentence with a small
-    ``min_chars``, or a full stop right after a hard cut). Keeping the word
-    before ``gs``, the spaces before it, and one more character makes each
-    look-behind stop exactly where it stops in the whole text.
+    whether that word starts a line. Trimming at ``gs`` would lose that context
+    (a list marker such as "1." right after an emitted sentence, or a full stop
+    right after a hard cut). Keeping the word before ``gs``, the spaces before
+    it, and one more character makes each look-behind stop exactly where it
+    stops in the whole text. A word longer than any rule's word is kept only in
+    part: its tail is still too long to match a rule, and a text with no spaces
+    no longer keeps everything it has seen.
     """
     t = gs
     while t > 0 and _is_word_char(text[t - 1]):
         t -= 1
+        if gs - t > _LONGEST_RULE_WORD:
+            return t
     while t > 0 and text[t - 1] in (" ", "\t"):
         t -= 1
     return t - 1 if t > 0 else 0
@@ -338,6 +379,7 @@ class Segmenter:
         max_chars = self.max_chars
         out: list[str] = []
         text = self._buf
+        nxt = _NextSpecial(text)
         gs = _skip_ws(text, self._start)  # group start
         while True:
             clause = (
@@ -345,9 +387,11 @@ class Segmenter:
                 if (self.eager_first_clause and self._first)
                 else None
             )
-            cands = _candidates(text, gs, final, clause)
             emitted = False
-            for c in cands:
+            first_open: int | None = None  # the first candidate that is a boundary or undecided
+            for c in _candidates(text, gs, final, clause, nxt):
+                if first_open is None and (not c.decided or c.boundary):
+                    first_open = c.end
                 if not c.decided:
                     break
                 if not c.boundary:
@@ -369,11 +413,11 @@ class Segmenter:
             # No boundary closes a group of acceptable size. Wrap if the group
             # is certainly longer than max_chars.
             limit = gs + max_chars
-            first_open = next((c.end for c in cands if not c.decided or c.boundary), None)
-            certainly_long = (first_open is None or first_open > limit) and len(text) > limit
-            if final and len(_strip(text[gs:])) > max_chars:
-                certainly_long = True
-            if certainly_long and len(_strip(text[gs:])) > max_chars:
+            # The stripped rest is longer than max_chars exactly when something
+            # other than whitespace lies at or beyond `limit` (gs is not whitespace).
+            long_rest = _skip_ws(text, limit) < len(text)
+            certainly_long = long_rest and (final or first_open is None or first_open > limit)
+            if certainly_long:
                 cut = _wrap_cut(text, gs, max_chars)
                 self._emit(out, _strip(text[gs:cut]))
                 self._wrapping = True

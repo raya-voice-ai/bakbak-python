@@ -7,6 +7,7 @@ import importlib.util
 import json
 import random
 import sys
+import time
 from types import ModuleType
 from typing import Any
 
@@ -130,3 +131,46 @@ def test_options_are_checked(options: dict[str, Any], error: type[Exception]) ->
 def test_push_takes_text_only() -> None:
     with pytest.raises(TypeError):
         Segmenter().push(b"bytes")  # type: ignore[arg-type]
+
+
+def test_long_words_and_hard_cuts_match_the_reference() -> None:
+    """Words longer than any rule word, ending in one (``xyzdr.``, ``abcetc.``),
+    cut anywhere by small max_chars: the capped look-behind must not change a
+    single split."""
+    reference = _reference()
+    parts = ["dr", "etc", "no", "a", "1", "22", "prof", "approx", "x" * 7, "क्ष" * 4, "डॉ"]
+    rng = random.Random(7)
+    for _ in range(1500):
+        words = []
+        for _ in range(rng.randint(1, 12)):
+            word = "".join(rng.choice(parts) for _ in range(rng.randint(1, 4)))
+            words.append(word + rng.choice(["", ".", ". ", " ", "\n", ". A", ".\n"]))
+        text = rng.choice([" ", ""]).join(words)
+        options: dict[str, Any] = {
+            "min_chars": rng.choice([0, 1, 20]),
+            "max_chars": rng.choice([3, 5, 9, 17, 400]),
+        }
+        expected = reference.split_sentences(text, reference.Options(**options))
+        assert split_sentences(text, **options) == expected, (text, options)
+        assert _stream(text, list(text), options) == expected, (text, options)
+        assert _stream(text, _random_cuts(text, rng), options) == expected, (text, options)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        ("यह एक वाक्य है। आपका पैकेज आज आएगा! " * 6000)[:200_000],
+        ("शब्द बिना विराम के " * 12000)[:200_000],
+        "क" * 200_000,
+    ],
+    ids=["punctuated", "unpunctuated", "no-spaces"],
+)
+def test_segmentation_is_linear(text: str) -> None:
+    """200,000 characters, with or without punctuation, well under a second;
+    streamed in LLM-sized pieces, still linear."""
+    started = time.perf_counter()
+    whole = split_sentences(text)
+    assert time.perf_counter() - started < 1.0
+    started = time.perf_counter()
+    assert _stream(text, [text[i : i + 6] for i in range(0, len(text), 6)], {}) == whole
+    assert time.perf_counter() - started < 5.0
