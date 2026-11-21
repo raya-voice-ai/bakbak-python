@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run pyright
+
+  test:
+    name: test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run pytest
+
+  test-floor:
+    name: test (oldest dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.10"
+      - run: uv venv
+      - run: >
+          uv pip install -e .
+          "websockets==14.2" "httpx==0.27.0" "typing-extensions==4.10.0"
+          pytest pytest-asyncio
+      - run: .venv/bin/python -m pytest
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - name: Import the built wheel
+        run: uv run --isolated --no-project --with dist/*.whl python -c "import bakbak; print(bakbak.__version__)"
+
+  conformance:
+    name: conformance manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Files match the manifest
+        working-directory: conformance
+        run: sha256sum -c --strict MANIFEST.sha256
+      - name: The manifest lists every file
+        working-directory: conformance
+        run: |
+          diff <(find . -type f ! -name MANIFEST.sha256 | sort) <(awk '{print $2}' MANIFEST.sha256 | sort)
+
+  live:
+    name: live (real API)
+    if: github.event_name != 'pull_request'
+    needs: [test]
+    runs-on: ubuntu-latest
+    env:
+      BAKBAK_API_KEY: ${{ secrets.BAKBAK_API_KEY }}
+      BAKBAK_BASE_URL: ${{ secrets.BAKBAK_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.BAKBAK_API_KEY != '' && env.BAKBAK_BASE_URL != ''
+      - uses: astral-sh/setup-uv@v6
+        if: env.BAKBAK_API_KEY != '' && env.BAKBAK_BASE_URL != ''
+      - name: Live tests (one at a time; they spend credits)
+        if: env.BAKBAK_API_KEY != '' && env.BAKBAK_BASE_URL != ''
+        run: uv sync --locked && uv run pytest -m live

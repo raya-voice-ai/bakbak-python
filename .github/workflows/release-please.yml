@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # A release created with the workflow's token does not start other
+  # workflows, so publishing happens here. PyPI trusts this workflow and the
+  # "pypi" environment (trusted publishing): no token is stored.
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/bakbak
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - name: The package version matches the tag
+        run: |
+          version=$(uv run --isolated --no-project --with dist/*.whl python -c "import bakbak; print(bakbak.__version__)")
+          tag="${{ needs.release-please.outputs.tag_name }}"
+          normalized=$(uvx --from packaging python -c "import sys; from packaging.version import Version; print(Version(sys.argv[1]), Version(sys.argv[2]))" "$version" "${tag#v}")
+          read -r a b <<< "$normalized"
+          test "$a" = "$b"
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true

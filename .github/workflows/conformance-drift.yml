@@ -1,0 +1,32 @@
+name: Conformance drift
+
+# The four official clients carry identical copies of conformance/. This job
+# compares our manifest with the other public repositories' and warns on drift.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare manifests
+        run: |
+          for repo in bakbak-js bakbak-mcp livekit-plugins-bakbak; do
+            url="https://raw.githubusercontent.com/raya-voice-ai/${repo}/main/conformance/MANIFEST.sha256"
+            if ! curl -fsSL "$url" -o "${RUNNER_TEMP}/${repo}.sha256"; then
+              echo "::warning title=Conformance drift::Could not fetch the manifest of ${repo}"
+              continue
+            fi
+            if diff -u conformance/MANIFEST.sha256 "${RUNNER_TEMP}/${repo}.sha256"; then
+              echo "${repo}: same conformance copy"
+            else
+              echo "::warning title=Conformance drift::conformance/ differs from ${repo}"
+            fi
+          done

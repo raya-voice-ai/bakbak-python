@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "python",
+      "package-name": "bakbak",
+      "changelog-path": "CHANGELOG.md",
+      "include-v-in-tag": true,
+      "prerelease": true,
+      "prerelease-type": "rc",
+      "versioning": "prerelease",
+      "extra-files": ["src/bakbak/_version.py"]
+    }
+  }
+}
