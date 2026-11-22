@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/), and entries after 1.0.0rc1 are
 written by release-please from the commit history.
 
+## [1.0.0-rc.4](https://github.com/raya-voice-ai/bakbak-python/compare/v1.0.0-rc.3...v1.0.0-rc.4) (2026-11-22)
+
+
+### Bug Fixes
+
+* raise when send_stream finds no text in input it cannot read, instead of sending nothing ([d481935](https://github.com/raya-voice-ai/bakbak-python/commit/d4819355ad3a2008ca9782797410f85dbf43423b))
+* read the text of Gemini's raw REST/SSE JSON in send_stream ([d481935](https://github.com/raya-voice-ai/bakbak-python/commit/d4819355ad3a2008ca9782797410f85dbf43423b))
+* refuse to wrap partial samples in WAV ([d481935](https://github.com/raya-voice-ai/bakbak-python/commit/d4819355ad3a2008ca9782797410f85dbf43423b))
+* say how to get the format stated when to_wav cannot wrap audio ([d481935](https://github.com/raya-voice-ai/bakbak-python/commit/d4819355ad3a2008ca9782797410f85dbf43423b))
+
+
+### Documentation
+
+* describe send_stream's Gemini JSON and no-text error, and to_wav's partial samples ([d481935](https://github.com/raya-voice-ai/bakbak-python/commit/d4819355ad3a2008ca9782797410f85dbf43423b))
+
 ## [1.0.0-rc.3](https://github.com/raya-voice-ai/bakbak-python/compare/v1.0.0-rc.2...v1.0.0-rc.3) (2026-11-22)
 
 
