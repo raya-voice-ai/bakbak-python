@@ -122,6 +122,106 @@ def test_text_delta_duck_typing() -> None:
         text_delta(b"bytes")
 
 
+def _gemini_json(*parts: dict[str, Any]) -> dict[str, Any]:
+    """A chunk of Gemini's raw REST/SSE stream (streamGenerateContent?alt=sse)."""
+    return {
+        "candidates": [{"content": {"parts": list(parts), "role": "model"}, "index": 0}],
+        "usageMetadata": {"promptTokenCount": 4},
+        "modelVersion": "gemini-test",
+    }
+
+
+def test_text_delta_reads_gemini_raw_json() -> None:
+    assert text_delta(_gemini_json({"text": "Namaste"})) == "Namaste"
+    assert text_delta(_gemini_json({"text": "Hello"}, {"text": " there"})) == "Hello there"
+    # Thought summaries are not the reply; neither are non-text parts.
+    thought = {"text": "Let me think", "thought": True}
+    call = {"functionCall": {"name": "lookup", "args": {}}}
+    assert text_delta(_gemini_json(thought, {"text": "Answer"}, call)) == "Answer"
+    assert text_delta(_gemini_json({"text": "kept", "thought": False})) == "kept"
+    assert text_delta(_gemini_json({"text": 7}, {"text": "ok"})) == "ok"
+    # No text anywhere: nothing to say.
+    assert text_delta(_gemini_json(thought)) is None
+    assert text_delta(_gemini_json(call)) is None
+    assert text_delta(_gemini_json()) is None
+    assert text_delta({"candidates": [{"content": {"role": "model"}}]}) is None
+    assert text_delta({"candidates": [{"finishReason": "SAFETY"}]}) is None
+    assert text_delta({"candidates": []}) is None
+    assert text_delta({"candidates": None, "usageMetadata": {}}) is None
+    assert text_delta({"promptFeedback": {"blockReason": "SAFETY"}}) is None
+    # Only the first candidate, as the SDKs read it.
+    two = _gemini_json({"text": "first"})
+    two["candidates"].append({"content": {"parts": [{"text": "second"}]}})
+    assert text_delta(two) == "first"
+
+
+def test_text_delta_reads_gemini_objects() -> None:
+    ns = SimpleNamespace
+
+    def response(*parts: object) -> SimpleNamespace:
+        return ns(candidates=[ns(content=ns(parts=list(parts), role="model"))], usage=None)
+
+    assert text_delta(response(ns(text="Hi", thought=None))) == "Hi"
+    assert (
+        text_delta(
+            response(
+                ns(text="hmm", thought=True),
+                ns(text="Hello", thought=None),
+                ns(text=None, thought=None, function_call=ns(name="f")),
+                ns(text=" again", thought=False),
+            )
+        )
+        == "Hello again"
+    )
+    assert text_delta(response(ns(text="hmm", thought=True))) is None
+    assert text_delta(response()) is None
+    assert text_delta(ns(candidates=[], usage=None)) is None
+    assert text_delta(ns(candidates=None, usage=None)) is None
+
+    class Part:
+        """A part whose text raises when it is not a text part (proto messages)."""
+
+        @property
+        def text(self) -> str:
+            raise AttributeError("text")
+
+    assert text_delta(response(Part(), ns(text="fine"))) == "fine"
+
+
+def test_text_delta_matches_the_google_genai_text_property() -> None:
+    """google-genai's response has both ``.candidates`` and a ``.text``
+    property; reading the parts must give what ``.text`` gives."""
+    ns = SimpleNamespace
+
+    class GenerateContentResponse:
+        def __init__(self, *parts: object) -> None:
+            self.candidates = [ns(content=ns(parts=list(parts), role="model"))]
+            self.usage_metadata = None
+
+        @property
+        def text(self) -> str | None:
+            # What google-genai's GenerateContentResponse.text does.
+            found = [
+                p.text
+                for p in self.candidates[0].content.parts
+                if isinstance(p.text, str) and not (isinstance(p.thought, bool) and p.thought)
+            ]
+            return "".join(found) if found else None
+
+    cases = [
+        GenerateContentResponse(ns(text="Namaste", thought=None)),
+        GenerateContentResponse(ns(text="a", thought=None), ns(text="b", thought=None)),
+        GenerateContentResponse(ns(text="plan", thought=True), ns(text="said", thought=None)),
+        GenerateContentResponse(ns(text="plan", thought=True)),
+        GenerateContentResponse(ns(text=None, thought=None)),
+        GenerateContentResponse(),
+    ]
+    for case in cases:
+        assert text_delta(case) == case.text
+    # An object whose candidates hold no parts falls back to its .text.
+    assert text_delta(ns(text="Namaste", candidates=[])) == "Namaste"
+
+
 def test_context_ids() -> None:
     generated = check_context_id(None)
     assert re.fullmatch(r"ctx_[0-9a-f]{32}", generated)

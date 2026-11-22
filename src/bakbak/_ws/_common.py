@@ -99,14 +99,38 @@ def _field(obj: object, name: str) -> object:
         return None
 
 
+def _first(items: object) -> object:
+    """The first entry of a non-empty list (or other sequence), else ``None``."""
+    if isinstance(items, Sequence) and not isinstance(items, str) and items:
+        return cast("Sequence[object]", items)[0]
+    return None
+
+
+def _gemini_text(candidates: object) -> str | None:
+    """The text of a Gemini response's first candidate: its parts' ``text``
+    joined, skipping thought parts (as the google-genai SDK's ``.text`` does).
+    ``None`` if it has no parts list or no text part."""
+    parts = _field(_field(_first(candidates), "content"), "parts")
+    if not isinstance(parts, Sequence) or isinstance(parts, str):
+        return None
+    texts: list[str] = []
+    for part in cast("Sequence[object]", parts):
+        text = _field(part, "text")
+        if isinstance(text, str) and not _field(part, "thought"):
+            texts.append(text)
+    return "".join(texts) if texts else None
+
+
 def text_delta(item: object) -> str | None:
     """The text a stream item carries, found by duck typing.
 
     Accepts ``str``; OpenAI chat chunks (``choices[0].delta.content``);
     OpenAI Responses events (``response.output_text.delta``); Anthropic
-    ``content_block_delta`` events (``delta.text``); Gemini chunks (``.text``);
-    and objects or dicts with a ``content`` string. Anything else, such as a
-    tool call, a reasoning delta or a usage event, carries no text: ``None``.
+    ``content_block_delta`` events (``delta.text``); Gemini responses, as SDK
+    objects or raw REST/SSE JSON (``candidates[0].content.parts[*].text``
+    joined, skipping thought parts; else ``.text``); and objects or dicts
+    with a ``text`` or ``content`` string. Anything else, such as a tool
+    call, a reasoning delta or a usage event, carries no text: ``None``.
     """
     if isinstance(item, str):
         return item
@@ -116,10 +140,8 @@ def text_delta(item: object) -> str | None:
         raise TypeError("send_stream() takes text, not bytes")
     choices = _field(item, "choices")
     if choices is not None:
-        if isinstance(choices, Sequence) and choices and not isinstance(choices, str):
-            content = _field(_field(cast("Sequence[object]", choices)[0], "delta"), "content")
-            return content if isinstance(content, str) else None
-        return None
+        content = _field(_field(_first(choices), "delta"), "content")
+        return content if isinstance(content, str) else None
     kind = _field(item, "type")
     delta = _field(item, "delta")
     if isinstance(delta, str):
@@ -130,6 +152,11 @@ def text_delta(item: object) -> str | None:
         return text if isinstance(text, str) else None
     if kind is not None and kind not in _TEXT_KINDS:
         return None
+    candidates = _field(item, "candidates")
+    if candidates is not None:
+        parts_text = _gemini_text(candidates)
+        if parts_text is not None:
+            return parts_text
     text = _field(item, "text")
     if isinstance(text, str):
         return text
