@@ -111,8 +111,16 @@ def test_audio_to_wav() -> None:
     with pytest.raises(ValueError, match="MP3 audio cannot be wrapped in WAV; decode it"):
         mp3.to_wav()
     unknown = Audio(b"\x00", "r", "application/octet-stream", None, None)
-    with pytest.raises(ValueError, match=r"did not state.*to_wav"):
+    # Unknown on purpose (§1); the message says how to make the response state them.
+    with pytest.raises(
+        ValueError,
+        match=r"did not state the audio's encoding and sample rate.*"
+        r"Send output_format with the request and the response states them; "
+        r"if you know them, use bakbak\.audio\.to_wav\(audio\.data, encoding, sample_rate\)",
+    ):
         unknown.to_wav()
+    with pytest.raises(ValueError, match="Send output_format"):
+        Audio(b"\x00\x00", "r", "audio/pcm", "pcm_s16le", None).to_wav()
     assert "bytes=8" in repr(raw)
     # A WAV body is returned as it is, whatever it was labelled.
     labelled = Audio(to_wav(b"\x00\x00", "pcm_s16le", 24000), "r", "audio/mpeg", "mp3", None)
