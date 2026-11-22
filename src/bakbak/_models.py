@@ -53,9 +53,9 @@ class Audio:
         in a WAV header (see :func:`bakbak.audio.to_wav`).
 
         Raises:
-            ValueError: for mp3, which has to be decoded rather than wrapped, or
+            ValueError: for mp3, which has to be decoded rather than wrapped;
                 raw audio whose encoding and sample rate the response did not
-                state.
+                state; or raw audio that is not a whole number of samples.
         """
         if _media_type(self.content_type) in _WAV_TYPES or is_wav(self.data):
             return self.data
@@ -64,7 +64,8 @@ class Audio:
         if self.encoding is None or self.sample_rate is None:
             raise ValueError(
                 "The response did not state the audio's encoding and sample rate, so it "
-                "cannot be wrapped in WAV; if you know them, use "
+                "cannot be wrapped in WAV. Send output_format with the request and the "
+                "response states them; if you know them, use "
                 "bakbak.audio.to_wav(audio.data, encoding, sample_rate)"
             )
         return to_wav(self.data, self.encoding, self.sample_rate)

@@ -95,8 +95,11 @@ def to_wav(data: bytes, encoding: str, sample_rate: int) -> bytes:
     specification requires for non-PCM formats.
 
     Raises:
-        ValueError: for an encoding WAV cannot carry this way (such as mp3), or
-            a sample rate that is not a positive integer.
+        ValueError: for an encoding WAV cannot carry this way (such as mp3), a
+            sample rate that is not a positive integer, or ``pcm_s16le`` or
+            ``pcm_f32le`` data that is not a whole number of samples (an odd
+            length, or one that is not a multiple of 4), whose header would
+            disagree with the data.
     """
     if encoding == "mp3":
         raise ValueError(MP3_TO_WAV)
@@ -108,6 +111,11 @@ def to_wav(data: bytes, encoding: str, sample_rate: int) -> bytes:
         raise ValueError("sample_rate must be a positive integer")
     width = _SAMPLE_SIZES[encoding]
     size = len(data)
+    if size % width:
+        raise ValueError(
+            f"{size} bytes of {encoding} audio is not a whole number of {width}-byte "
+            "samples, so it cannot be wrapped in WAV"
+        )
     # RIFF chunks are word aligned: an odd-sized data chunk gets a pad byte that
     # the RIFF size counts and the data size does not.
     pad = b"\x00" if size % 2 else b""

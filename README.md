@@ -221,8 +221,11 @@ with client.tts.websocket(voice_id=voice_id, language="hi", model="m1") as ws:
 sends each one the moment it is complete, then calls `end_input()`. It takes
 strings, or the stream events of OpenAI-, Anthropic- and Gemini-style SDKs
 directly: the text delta is found by duck typing (`choices[0].delta.content`,
-`content_block_delta` → `delta.text`, `.text`), and tool calls or reasoning
-deltas are skipped. No LLM SDK is imported.
+`response.output_text.delta`, `content_block_delta` → `delta.text`,
+`candidates[0].content.parts[*].text`, or a `text` or `content` string), and
+tool calls, reasoning deltas and Gemini's thought parts are skipped. Gemini's raw
+REST/SSE JSON, parsed into dicts, works the same as its SDK's objects. No LLM SDK
+is imported.
 
 ```python
 from openai import AsyncOpenAI
@@ -236,6 +239,14 @@ async for audio in ctx.audio():
     player.write(audio)
 await sender
 ```
+
+If the tokens end with no text, and some of them had none of the shapes above
+(a framework's own event objects, say, or tuples), `send_stream` ends input as
+usual and then raises `TypeError` naming the shapes it reads, rather than
+return having sent nothing: map such events to `str` first. A stream it can
+read that simply has no text, such as one that only calls tools (or yields
+`None` for events without text), is not an error, and neither is a
+`send_stream` stopped by `cancel()`.
 
 See [`examples/llm_streaming.py`](https://github.com/raya-voice-ai/bakbak-python/blob/main/examples/llm_streaming.py).
 
@@ -296,7 +307,10 @@ wav = to_wav(raw_bytes, "pcm_mulaw", 8000)
 
 `pcm_s16le` gets the canonical 44-byte header; `pcm_f32le`, `pcm_alaw` and
 `pcm_mulaw` get the 58-byte header (with a `fact` chunk) that their WAV formats
-require. There are no playback helpers: hand the bytes to your audio library.
+require. Audio that is not a whole number of samples (`pcm_s16le` of odd
+length, or `pcm_f32le` whose length is not a multiple of 4) raises `ValueError`
+rather than get a header that disagrees with it; so does `audio.to_wav()`.
+There are no playback helpers: hand the bytes to your audio library.
 
 ## Errors
 

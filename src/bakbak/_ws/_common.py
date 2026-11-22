@@ -25,6 +25,7 @@ from ..audio import stream_sample_size
 
 __all__ = [
     "WEBSOCKET_LOGGER",
+    "StreamText",
     "build_request",
     "check_context_id",
     "connect_error",
@@ -99,14 +100,38 @@ def _field(obj: object, name: str) -> object:
         return None
 
 
+def _first(items: object) -> object:
+    """The first entry of a non-empty list (or other sequence), else ``None``."""
+    if isinstance(items, Sequence) and not isinstance(items, str) and items:
+        return cast("Sequence[object]", items)[0]
+    return None
+
+
+def _gemini_text(candidates: object) -> str | None:
+    """The text of a Gemini response's first candidate: its parts' ``text``
+    joined, skipping thought parts (as the google-genai SDK's ``.text`` does).
+    ``None`` if it has no parts list or no text part."""
+    parts = _field(_field(_first(candidates), "content"), "parts")
+    if not isinstance(parts, Sequence) or isinstance(parts, str):
+        return None
+    texts: list[str] = []
+    for part in cast("Sequence[object]", parts):
+        text = _field(part, "text")
+        if isinstance(text, str) and not _field(part, "thought"):
+            texts.append(text)
+    return "".join(texts) if texts else None
+
+
 def text_delta(item: object) -> str | None:
     """The text a stream item carries, found by duck typing.
 
     Accepts ``str``; OpenAI chat chunks (``choices[0].delta.content``);
     OpenAI Responses events (``response.output_text.delta``); Anthropic
-    ``content_block_delta`` events (``delta.text``); Gemini chunks (``.text``);
-    and objects or dicts with a ``content`` string. Anything else, such as a
-    tool call, a reasoning delta or a usage event, carries no text: ``None``.
+    ``content_block_delta`` events (``delta.text``); Gemini responses, as SDK
+    objects or raw REST/SSE JSON (``candidates[0].content.parts[*].text``
+    joined, skipping thought parts; else ``.text``); and objects or dicts
+    with a ``text`` or ``content`` string. Anything else, such as a tool
+    call, a reasoning delta or a usage event, carries no text: ``None``.
     """
     if isinstance(item, str):
         return item
@@ -116,10 +141,8 @@ def text_delta(item: object) -> str | None:
         raise TypeError("send_stream() takes text, not bytes")
     choices = _field(item, "choices")
     if choices is not None:
-        if isinstance(choices, Sequence) and choices and not isinstance(choices, str):
-            content = _field(_field(cast("Sequence[object]", choices)[0], "delta"), "content")
-            return content if isinstance(content, str) else None
-        return None
+        content = _field(_field(_first(choices), "delta"), "content")
+        return content if isinstance(content, str) else None
     kind = _field(item, "type")
     delta = _field(item, "delta")
     if isinstance(delta, str):
@@ -130,11 +153,71 @@ def text_delta(item: object) -> str | None:
         return text if isinstance(text, str) else None
     if kind is not None and kind not in _TEXT_KINDS:
         return None
+    candidates = _field(item, "candidates")
+    if candidates is not None:
+        parts_text = _gemini_text(candidates)
+        if parts_text is not None:
+            return parts_text
     text = _field(item, "text")
     if isinstance(text, str):
         return text
     content = _field(item, "content")
     return content if isinstance(content, str) else None
+
+
+# Fields whose presence means text_delta knows the item's shape, even when it
+# carries no text (an OpenAI tool-call chunk, an Anthropic message_start).
+# `text` comes last: on google-genai's response it is a property that logs a
+# warning for a function call, and `candidates` already answers for it.
+_SHAPE_FIELDS = ("choices", "candidates", "type", "delta", "content", "text")
+
+
+def _recognised(item: object) -> bool:
+    # None is a known item without text: code that maps events to text often
+    # yields None for the others, and a reply that is only a tool call is all None.
+    return (
+        item is None
+        or isinstance(item, str)
+        or any(_field(item, name) is not None for name in _SHAPE_FIELDS)
+    )
+
+
+class StreamText:
+    """Reads ``send_stream``'s items with :func:`text_delta`, and remembers
+    enough to tell input it cannot read from input that had no text (§6.2).
+
+    It never keeps an item, only a count and two flags, so nothing of the
+    input can reach an error message or a log.
+    """
+
+    __slots__ = ("_found", "_items", "_unrecognised")
+
+    def __init__(self) -> None:
+        self._items = 0
+        self._found = False
+        self._unrecognised = False
+
+    def read(self, item: object) -> str | None:
+        """The text ``item`` carries, if any."""
+        self._items += 1
+        text = text_delta(item)
+        if text:
+            self._found = True
+        elif not self._found and not self._unrecognised and not _recognised(item):
+            self._unrecognised = True
+        return text
+
+    def check(self) -> None:
+        """At the end of the input: raise if there were items, none had text,
+        and at least one had none of the shapes ``text_delta`` reads."""
+        if self._items and not self._found and self._unrecognised:
+            items = "item" if self._items == 1 else "items"
+            raise TypeError(
+                f"send_stream() found no text in {self._items} {items}. It reads str, "
+                "OpenAI Chat Completions and Responses events, Anthropic events, Gemini "
+                "responses (SDK objects or raw JSON) and objects with a text or content "
+                "string; map other events to str first."
+            )
 
 
 def connect_error(exc: BaseException) -> tuple[BakbakError, str | None] | None:

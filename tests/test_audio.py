@@ -52,6 +52,35 @@ def test_odd_data_gets_a_pad_byte() -> None:
     assert struct.unpack_from("<I", data, 54)[0] == 3  # the data size excludes the pad
 
 
+@pytest.mark.parametrize(
+    ("encoding", "size", "width"),
+    [
+        ("pcm_s16le", 1, 2),
+        ("pcm_s16le", 3, 2),
+        ("pcm_s16le", 4801, 2),
+        ("pcm_f32le", 1, 4),
+        ("pcm_f32le", 2, 4),
+        ("pcm_f32le", 3, 4),
+        ("pcm_f32le", 4802, 4),
+    ],
+)
+def test_to_wav_refuses_partial_samples(encoding: str, size: int, width: int) -> None:
+    # A header for these would disagree with the data: say so instead.
+    message = rf"^{size} bytes of {encoding} audio is not a whole number of {width}-byte samples"
+    with pytest.raises(ValueError, match=message):
+        to_wav(b"\x00" * size, encoding, 24000)
+    with pytest.raises(ValueError, match=message):
+        Audio(b"\x00" * size, "r", "audio/pcm", encoding, 24000).to_wav()
+
+
+@pytest.mark.parametrize(("encoding", "width"), [("pcm_s16le", 2), ("pcm_f32le", 4)])
+def test_to_wav_takes_whole_samples(encoding: str, width: int) -> None:
+    for samples in (0, 1, 3):
+        data = to_wav(b"\x00" * (samples * width), encoding, 16000)
+        assert data.endswith(b"\x00" * (samples * width))
+        assert struct.unpack_from("<I", data, 4)[0] == len(data) - 8
+
+
 def test_to_wav_refuses_what_it_cannot_wrap() -> None:
     with pytest.raises(ValueError, match="MP3 audio cannot be wrapped in WAV"):
         to_wav(b"x", "mp3", 24000)
@@ -82,8 +111,16 @@ def test_audio_to_wav() -> None:
     with pytest.raises(ValueError, match="MP3 audio cannot be wrapped in WAV; decode it"):
         mp3.to_wav()
     unknown = Audio(b"\x00", "r", "application/octet-stream", None, None)
-    with pytest.raises(ValueError, match=r"did not state.*to_wav"):
+    # Unknown on purpose (§1); the message says how to make the response state them.
+    with pytest.raises(
+        ValueError,
+        match=r"did not state the audio's encoding and sample rate.*"
+        r"Send output_format with the request and the response states them; "
+        r"if you know them, use bakbak\.audio\.to_wav\(audio\.data, encoding, sample_rate\)",
+    ):
         unknown.to_wav()
+    with pytest.raises(ValueError, match="Send output_format"):
+        Audio(b"\x00\x00", "r", "audio/pcm", "pcm_s16le", None).to_wav()
     assert "bytes=8" in repr(raw)
     # A WAV body is returned as it is, whatever it was labelled.
     labelled = Audio(to_wav(b"\x00\x00", "pcm_s16le", 24000), "r", "audio/mpeg", "mp3", None)
