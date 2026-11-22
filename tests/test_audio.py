@@ -6,12 +6,14 @@ import io
 import struct
 import wave
 
+import httpx
 import pytest
 
 from bakbak import Audio
+from bakbak._base_client import _audio
 from bakbak._sse import SSEDecoder
 from bakbak._streaming import SampleAligner
-from bakbak.audio import sample_size, to_wav
+from bakbak.audio import sample_size, to_wav, wav_format
 
 
 def test_s16_wav_decodes_with_the_wave_module() -> None:
@@ -51,8 +53,10 @@ def test_odd_data_gets_a_pad_byte() -> None:
 
 
 def test_to_wav_refuses_what_it_cannot_wrap() -> None:
-    with pytest.raises(ValueError, match="mp3"):
+    with pytest.raises(ValueError, match="MP3 audio cannot be wrapped in WAV"):
         to_wav(b"x", "mp3", 24000)
+    with pytest.raises(ValueError, match="pcm_alaw"):
+        to_wav(b"x", "opus", 24000)
     with pytest.raises(ValueError, match="sample_rate"):
         to_wav(b"x", "pcm_s16le", 0)
 
@@ -74,12 +78,83 @@ def test_audio_to_wav() -> None:
     wav = Audio(b"RIFF....", "r", "audio/wav", "pcm_s16le", 16000)
     assert wav.to_wav() == wav.data
     mp3 = Audio(b"ID3", "r", "audio/mpeg", "mp3", None)
-    with pytest.raises(ValueError):
+    # Not the advice for raw audio: following it would not help.
+    with pytest.raises(ValueError, match="MP3 audio cannot be wrapped in WAV; decode it"):
         mp3.to_wav()
     unknown = Audio(b"\x00", "r", "application/octet-stream", None, None)
-    with pytest.raises(ValueError, match="to_wav"):
+    with pytest.raises(ValueError, match=r"did not state.*to_wav"):
         unknown.to_wav()
     assert "bytes=8" in repr(raw)
+    # A WAV body is returned as it is, whatever it was labelled.
+    labelled = Audio(to_wav(b"\x00\x00", "pcm_s16le", 24000), "r", "audio/mpeg", "mp3", None)
+    assert labelled.to_wav() == labelled.data
+
+
+def _fmt(tag: int, channels: int, rate: int, bits: int, extra: bytes = b"") -> bytes:
+    width = bits // 8
+    body = struct.pack("<HHIIHH", tag, channels, rate, rate * width, width, bits) + extra
+    return b"fmt " + struct.pack("<I", len(body)) + body
+
+
+def _riff(*chunks: bytes, size: int = 0xFFFFFFFF) -> bytes:
+    return b"RIFF" + struct.pack("<I", size) + b"WAVE" + b"".join(chunks)
+
+
+@pytest.mark.parametrize("encoding", ["pcm_s16le", "pcm_f32le", "pcm_mulaw", "pcm_alaw"])
+def test_wav_format_reads_what_to_wav_writes(encoding: str) -> None:
+    assert wav_format(to_wav(b"\x00" * 8, encoding, 16000)) == (encoding, 16000)
+
+
+def test_wav_format_tolerates_streamed_sizes_and_other_chunks() -> None:
+    data_chunk = b"data" + struct.pack("<I", 0xFFFFFFFF) + b"\x00\x01" * 10
+    # The server's standard model writes 0xFFFFFFFF for both sizes.
+    assert wav_format(_riff(_fmt(1, 1, 24000, 16), data_chunk)) == ("pcm_s16le", 24000)
+    # A chunk before fmt, odd-sized and so followed by a pad byte.
+    junk = b"LIST" + struct.pack("<I", 3) + b"abc" + b"\x00"
+    assert wav_format(_riff(junk, _fmt(3, 1, 22050, 32), data_chunk)) == ("pcm_f32le", 22050)
+    # WAVE_FORMAT_EXTENSIBLE: the tag is the start of the sub-format GUID.
+    guid = struct.pack("<H", 7) + b"\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
+    extensible = struct.pack("<HHI", 22, 8, 4) + guid
+    assert wav_format(_riff(_fmt(0xFFFE, 1, 8000, 8, extensible))) == ("pcm_mulaw", 8000)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        b"RIFF",
+        b"ID3\x04\x00" + bytes(64),  # mp3
+        b"\xff\xfb\x90\x64" + bytes(64),
+        b"RIFF\x00\x00\x00\x00WAVE",  # no chunks at all
+        _riff(_fmt(1, 2, 24000, 16)),  # stereo
+        _riff(_fmt(1, 1, 24000, 24)),  # 24-bit
+        _riff(_fmt(1, 1, 0, 16)),  # no rate
+        _riff(_fmt(1, 1, 24000, 16))[:30],  # fmt cut short
+        _riff(b"data" + struct.pack("<I", 4) + b"\x00" * 4, _fmt(1, 1, 24000, 16)),  # data first
+        _riff(b"LIST" + struct.pack("<I", 0xFFFFFFFF) + b"x" * 8),  # runs off the end
+        _riff(_fmt(0xFFFE, 1, 8000, 8, struct.pack("<HHI", 22, 8, 4))),  # GUID missing
+    ],
+)
+def test_wav_format_refuses_anything_else(data: bytes) -> None:
+    assert wav_format(data) is None
+
+
+def test_whole_file_metadata_falls_back_to_the_wav_header() -> None:
+    wav = _riff(_fmt(1, 1, 24000, 16), b"data" + struct.pack("<I", 4) + b"\x00" * 4)
+    bare = httpx.Response(200, headers={"content-type": "audio/wav", "x-request-id": "req_1"})
+    audio = _audio(bare, wav)
+    assert (audio.encoding, audio.sample_rate) == ("pcm_s16le", 24000)
+    # The headers win when the server sends them.
+    stated = httpx.Response(
+        200, headers={"x-audio-format": "pcm_s16le", "x-audio-sample-rate": "16000"}
+    )
+    assert _audio(stated, wav).sample_rate == 16000
+    # mp3 states its format and no rate; the request's rate is not guessed.
+    mp3 = _audio(httpx.Response(200, headers={"x-audio-format": "mp3"}), b"ID3" + bytes(16))
+    assert (mp3.encoding, mp3.sample_rate) == ("mp3", None)
+    # Raw audio with no headers stays unknown.
+    raw = _audio(httpx.Response(200, headers={"content-type": "audio/pcm"}), b"\x00" * 8)
+    assert (raw.encoding, raw.sample_rate) == (None, None)
 
 
 def test_audio_save_writes_exact_bytes(tmp_path: pytest.TempPathFactory) -> None:

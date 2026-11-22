@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 from typing_extensions import override
 
-from .audio import to_wav
+from .audio import MP3_TO_WAV, is_wav, to_wav
 
 __all__ = ["Audio", "AudioChunk"]
 
@@ -28,8 +28,11 @@ class Audio:
         content_type: ``audio/wav``, ``audio/mpeg``, ``audio/pcm``,
             ``audio/basic`` (raw mu-law) or ``application/octet-stream``
             (raw A-law).
-        encoding: ``X-Audio-Format`` (the encoding, or ``mp3``), if present.
-        sample_rate: ``X-Audio-Sample-Rate``, if present.
+        encoding: ``pcm_s16le``, ``pcm_f32le``, ``pcm_mulaw``, ``pcm_alaw`` or
+            ``mp3``. It is ``X-Audio-Format``; a WAV response without that
+            header (no ``output_format``) gets it from the file's own header.
+        sample_rate: in Hz, from ``X-Audio-Sample-Rate`` or, like ``encoding``,
+            from the WAV header. ``None`` for mp3, whose rate is in its frames.
     """
 
     data: bytes = field(repr=False)
@@ -50,15 +53,19 @@ class Audio:
         in a WAV header (see :func:`bakbak.audio.to_wav`).
 
         Raises:
-            ValueError: for mp3, or raw audio whose encoding and sample rate
-                the response did not state.
+            ValueError: for mp3, which has to be decoded rather than wrapped, or
+                raw audio whose encoding and sample rate the response did not
+                state.
         """
-        if _media_type(self.content_type) in _WAV_TYPES:
+        if _media_type(self.content_type) in _WAV_TYPES or is_wav(self.data):
             return self.data
+        if self.encoding == "mp3" or _media_type(self.content_type) == "audio/mpeg":
+            raise ValueError(MP3_TO_WAV)
         if self.encoding is None or self.sample_rate is None:
             raise ValueError(
-                "The response did not state the audio encoding and sample rate; "
-                "use bakbak.audio.to_wav(data, encoding, sample_rate)"
+                "The response did not state the audio's encoding and sample rate, so it "
+                "cannot be wrapped in WAV; if you know them, use "
+                "bakbak.audio.to_wav(audio.data, encoding, sample_rate)"
             )
         return to_wav(self.data, self.encoding, self.sample_rate)
 

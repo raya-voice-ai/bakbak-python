@@ -46,6 +46,7 @@ from ._sse import SSEDecoder
 from ._streaming import OpenStream, decode_audio, parse_events
 from ._types import NotGiven, Timeout, TimeoutLike, coerce_timeout
 from ._utils import as_mapping, client_header, logger, user_agent, websocket_url
+from .audio import wav_format
 from .types import Voice
 
 __all__ = ["AsyncAPIClient", "SyncAPIClient"]
@@ -101,12 +102,20 @@ def _header_int(headers: httpx.Headers, name: str) -> int | None:
 
 def _audio(response: httpx.Response, data: bytes) -> Audio:
     headers = response.headers
+    encoding = headers.get("x-audio-format") or None
+    sample_rate = _header_int(headers, "x-audio-sample-rate")
+    if encoding is None and sample_rate is None:
+        # Without output_format the server sends its WAV with no X-Audio-*
+        # headers; the file says what it holds (BEHAVIOR.md 5.2).
+        found = wav_format(data)
+        if found is not None:
+            encoding, sample_rate = found
     return Audio(
         data=data,
         request_id=headers.get("x-request-id"),
         content_type=headers.get("content-type"),
-        encoding=headers.get("x-audio-format"),
-        sample_rate=_header_int(headers, "x-audio-sample-rate"),
+        encoding=encoding,
+        sample_rate=sample_rate,
     )
 
 
