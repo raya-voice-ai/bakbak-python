@@ -167,7 +167,9 @@ def text_delta(item: object) -> str | None:
 
 # Fields whose presence means text_delta knows the item's shape, even when it
 # carries no text (an OpenAI tool-call chunk, an Anthropic message_start).
-_SHAPE_FIELDS = ("choices", "type", "delta", "text", "content", "candidates")
+# `text` comes last: on google-genai's response it is a property that logs a
+# warning for a function call, and `candidates` already answers for it.
+_SHAPE_FIELDS = ("choices", "candidates", "type", "delta", "content", "text")
 
 
 def _recognised(item: object) -> bool:
