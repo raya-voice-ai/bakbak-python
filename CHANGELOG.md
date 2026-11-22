@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/), and entries after 1.0.0rc1 are
 written by release-please from the commit history.
 
+## [1.0.0-rc.3](https://github.com/raya-voice-ai/bakbak-python/compare/v1.0.0-rc.2...v1.0.0-rc.3) (2026-11-22)
+
+
+### Bug Fixes
+
+* keep the WebSocket's internal callbacks off its public surface ([b62de6d](https://github.com/raya-voice-ai/bakbak-python/commit/b62de6d60b2f47b4324d704bb03bd2268cf37495))
+* read a headerless WAV's encoding and sample rate from its fmt chunk ([b62de6d](https://github.com/raya-voice-ai/bakbak-python/commit/b62de6d60b2f47b4324d704bb03bd2268cf37495))
+* say plainly that MP3 audio can't be wrapped in WAV ([b62de6d](https://github.com/raya-voice-ai/bakbak-python/commit/b62de6d60b2f47b4324d704bb03bd2268cf37495))
+* stop repeating a validation error's text in the 422 message ([b62de6d](https://github.com/raya-voice-ai/bakbak-python/commit/b62de6d60b2f47b4324d704bb03bd2268cf37495))
+
+
+### Documentation
+
+* fix the README's PyPI links, the m1 speed example and the WebSocket example ([b62de6d](https://github.com/raya-voice-ai/bakbak-python/commit/b62de6d60b2f47b4324d704bb03bd2268cf37495))
+
 ## [1.0.0-rc.2](https://github.com/raya-voice-ai/bakbak-python/compare/v1.0.0-rc.1...v1.0.0-rc.2) (2026-11-21)
 
 
