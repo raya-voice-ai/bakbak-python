@@ -56,7 +56,7 @@ DETAIL = [
     {"loc": ["body", "items", 0], "msg": "Indexed"},
 ]
 RENDERED = (
-    "voice_id: Field required; output_format.encoding: Value error, bad; Body problem; "
+    "voice_id: Field required; output_format.encoding: bad; Body problem; "
     "No location; plain entry; items.0: Indexed"
 )
 
@@ -105,6 +105,31 @@ RENDERED = (
             "Invalid request: voice_id: Field required.",
         ),
         ({"message": "Shown", "detail": [{"loc": ["body", "x"]}]}, 422, None, "Shown"),
+        # The server quotes a validator's text without pydantic's "Value error, ",
+        # so the entry is not news and is not added a second time.
+        (
+            {
+                "message": "Invalid request: speed: speed must be between 0.5 and 1.5 (inclusive).",
+                "detail": [
+                    {
+                        "type": "value_error",
+                        "loc": ["body", "speed"],
+                        "msg": "Value error, speed must be between 0.5 and 1.5 (inclusive)",
+                    }
+                ],
+            },
+            422,
+            None,
+            "Invalid request: speed: speed must be between 0.5 and 1.5 (inclusive).",
+        ),
+        # Only the leading prefix goes, and an entry that is nothing but it is skipped.
+        (
+            {"detail": [{"loc": ["body", "a"], "msg": "Value error, x. Value error, y"}]},
+            422,
+            None,
+            "a: x. Value error, y",
+        ),
+        ({"message": "Shown", "detail": [{"msg": "Value error, "}]}, 422, None, "Shown"),
     ],
 )
 def test_message(body: object, status: int, reason: str | None, expected: str) -> None:

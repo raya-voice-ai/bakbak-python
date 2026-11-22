@@ -56,7 +56,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Every example in [`examples/`](examples) runs as is with `BAKBAK_API_KEY` set.
+Every example in [`examples/`](https://github.com/raya-voice-ai/bakbak-python/tree/main/examples) runs as is with `BAKBAK_API_KEY` set.
 
 ## Configuration
 
@@ -95,19 +95,28 @@ patient = client.with_options(timeout=120, max_retries=4)
 ```python
 audio = client.tts.generate(
     text="आपका ऑर्डर कल पहुँचेगा।",
-    voice_id=voice_id,
+    voice_id=voice_id,  # a standard voice
     language="hi",
-    model="m1",
-    speed=1.1,  # 0.5 to 1.5
+    model="standard",
+    speed=1.1,  # 0.5 to 1.5; standard voices only
     output_format={"container": "wav", "encoding": "pcm_s16le", "sample_rate": 24000},
 )
 audio.data  # bytes, exactly as received
 audio.request_id  # quote it to support
 audio.content_type  # audio/wav, audio/mpeg, audio/pcm, audio/basic, application/octet-stream
-audio.encoding, audio.sample_rate  # from X-Audio-Format / X-Audio-Sample-Rate
+audio.encoding, audio.sample_rate  # e.g. "pcm_s16le", 24000; for mp3, "mp3", None
 audio.save("out.wav")
 audio.to_wav()  # WAV bytes; raw PCM, mu-law and A-law get a header
 ```
+
+`speed` changes the speaking rate of `standard` voices. `m1` voices accept it
+and speak at their own pace.
+
+`audio.encoding` and `audio.sample_rate` come from the `X-Audio-Format` and
+`X-Audio-Sample-Rate` headers. Without `output_format` the server sends neither,
+and the SDK reads them from the WAV file's own header. An mp3 states no sample
+rate (it is in the MP3 frames), and `to_wav()` raises `ValueError` for it: decode
+it with an audio library, or ask for `{"container": "wav", ...}` instead.
 
 `output_format`:
 
@@ -149,18 +158,21 @@ saves the per-request connection and gateway cost. It is the fastest path to
 first audio and the one to use for voice agents.
 
 ```python
-async with client.tts.websocket(
-    voice_id=voice_id,
-    language="hi",
-    model="m1",
-    output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": 16000},
-) as ws:  # opens the socket now (prewarm)
-    ctx = ws.context()  # requests on a context play in order
-    await ctx.send(text="पहला वाक्य।")
-    await ctx.send(text="दूसरा वाक्य।")
-    ctx.end_input()
-    async for audio in ctx.audio():  # bytes, in order; raises the first failure
-        player.write(audio)
+from bakbak import AsyncBakbak
+
+async with AsyncBakbak() as client:  # in an async function
+    async with client.tts.websocket(
+        voice_id=voice_id,
+        language="hi",
+        model="m1",
+        output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": 16000},
+    ) as ws:  # opens the socket now (prewarm)
+        ctx = ws.context()  # requests on a context play in order
+        await ctx.send(text="पहला वाक्य।")
+        await ctx.send(text="दूसरा वाक्य।")
+        ctx.end_input()
+        async for audio in ctx.audio():  # bytes, in order; raises the first failure
+            player.write(audio)
 ```
 
 - **Contexts.** `ws.context(context_id=None, **defaults)` returns a context; the
@@ -190,10 +202,11 @@ async with client.tts.websocket(
 - **Connection-level errors.** Errors about no request in particular go to
   `client.tts.websocket(on_error=callback)`.
 
-The sync client has the same API; it reads the socket on a background thread,
-so read `ctx.audio()` on one thread while another sends:
+The sync client (`Bakbak`) has the same API without `await`; it reads the socket
+on a background thread, so read `ctx.audio()` on one thread while another sends:
 
 ```python
+client = Bakbak()
 with client.tts.websocket(voice_id=voice_id, language="hi", model="m1") as ws:
     ctx = ws.context()
     handle = ctx.send(text="नमस्ते।")
@@ -224,7 +237,7 @@ async for audio in ctx.audio():
 await sender
 ```
 
-See [`examples/llm_streaming.py`](examples/llm_streaming.py).
+See [`examples/llm_streaming.py`](https://github.com/raya-voice-ai/bakbak-python/blob/main/examples/llm_streaming.py).
 
 ## Voices
 
@@ -234,7 +247,17 @@ for voice in voices:
     print(voice.id, voice.name, voice.language, voice.model)
 ```
 
-A voice belongs to one model; `m1` voices use `en` for English.
+A voice belongs to one model, and the voice decides which languages work.
+Today's catalog:
+
+| Model | Languages with voices |
+|---|---|
+| `m1` | `hi`, `en`, `kn` |
+| `standard` | `hi`, `en-in`, `en-us`, `as`, `bn`, `gu`, `kn`, `ml`, `mr`, `ne`, `ta`, `te` |
+
+`m1` voices use `en` for English; `standard` voices use `en-in` or `en-us`. The
+server also accepts `pa` (Punjabi), which has no voice yet. `voices.list()` is
+the source of truth: voices are added without an SDK release.
 
 ## Sentence segmentation
 
@@ -255,7 +278,10 @@ remaining = segmenter.flush()
 
 It understands the danda (।, ॥), titles and initials (`Dr.`, `डॉ.`, `A. P. J.`),
 decimals and domains (`3.14`, `getraya.app`), list markers and abbreviations, and
-never splits inside an Indic conjunct. Options: `min_chars` (20),
+never splits inside an Indic conjunct. After the first sentence, one shorter
+than `min_chars` is held and sent with the next, so
+`split_sentences("आपका ऑर्डर तैयार है। कल डिलीवरी होगी॥ धन्यवाद।")` gives two
+pieces, not three; the last piece goes out whatever its length. Options: `min_chars` (20),
 `first_min_chars` (1), `max_chars` (400, at most 5,000), `eager_first_clause`
 (False), `first_clause_min_chars` (24). Lengths are counted in code points. The
 JavaScript SDK and the LiveKit plugin split every text exactly the same way.
@@ -294,6 +320,8 @@ BakbakError
 `APIError` has `status`, `error_code`, `message`, `retryable`, `request_id` and
 `body` (the parsed JSON, so fields such as `required_inr` stay readable).
 `StreamInterruptedError` adds `audio_bytes`: how much audio you received.
+Requests the API gateway refuses before they reach the service (an invalid key,
+an unknown path) have no `error_code`; their class says what happened.
 
 ```python
 import bakbak
@@ -341,23 +369,27 @@ audio = raw.parse()
 ## Forward compatibility
 
 Fields the SDK does not model yet go in `extra_body` (merged into the request
-body) and `extra_headers`. Unknown response fields and stream events are
-ignored. The SDK sends exactly the fields you give it; the server validates them.
+body) and `extra_headers`. The server refuses fields it does not know with a 422,
+so `extra_body` is for fields the server already supports. Unknown response
+fields and stream events are ignored. The SDK sends exactly the fields you give
+it; the server validates them.
 
 ## Latency tips
 
 - **Reuse one client.** It keeps connections alive; `client.prewarm()` opens one
   ahead of the first request.
 - **Use the WebSocket for agents.** Open it early (`await ws.connect()`, or
-  `async with`), so the first request pays no handshake. Measured against a
-  staging deployment of the API (m1, 20 sequential requests each, kept-alive
+  `async with`), so the first request pays no handshake. Measured from a machine
+  in the same region as the API (m1, 20 sequential requests each, kept-alive
   connections, `examples/bench_ttfa.py`): time to first audio p50 **20.7 ms over
-  the WebSocket** versus 33.3 ms over SSE.
+  the WebSocket** versus 33.3 ms over SSE. From farther away both include your
+  network's round trips (one test from a laptop saw 58 ms versus 158 ms), and the
+  WebSocket stays ahead.
 - **Stream sentence by sentence** with `send_stream`, and consider
   `Segmenter(eager_first_clause=True)` when first sentences are long.
 - **Ask for the format you play.** For phone calls use
   `{"container": "raw", "encoding": "pcm_mulaw", "sample_rate": 8000}`, and skip
-  resampling and transcoding (see [`examples/telephony.py`](examples/telephony.py)).
+  resampling and transcoding (see [`examples/telephony.py`](https://github.com/raya-voice-ai/bakbak-python/blob/main/examples/telephony.py)).
 - **Keep the event loop free.** `send_stream` reads a sync iterable on the event
   loop; pass an async iterable from an async LLM client.
 
@@ -378,9 +410,10 @@ logging.getLogger("bakbak").setLevel(logging.DEBUG)
 - [Python SDK guide](https://docs.litwizlabs.com/documentation/sdk-python)
 - [WebSocket API reference](https://docs.litwizlabs.com/api-reference/tts-websocket)
 - [Errors and error codes](https://docs.litwizlabs.com/documentation/tts-errors)
-- [`examples/`](examples): runnable scripts for each feature
-- [`conformance/BEHAVIOR.md`](conformance/BEHAVIOR.md): the behaviour every official
-  Bakbak client follows, and the API in one page
-- [CHANGELOG](CHANGELOG.md) · [CONTRIBUTING](CONTRIBUTING.md) · [SECURITY](SECURITY.md)
+- [`examples/`](https://github.com/raya-voice-ai/bakbak-python/tree/main/examples): runnable scripts for each feature
+- [`conformance/BEHAVIOR.md`](https://github.com/raya-voice-ai/bakbak-python/blob/main/conformance/BEHAVIOR.md): the behaviour
+  every official Bakbak client follows, and the API in one page
+- [CHANGELOG](https://github.com/raya-voice-ai/bakbak-python/blob/main/CHANGELOG.md) · [CONTRIBUTING](https://github.com/raya-voice-ai/bakbak-python/blob/main/CONTRIBUTING.md) ·
+  [SECURITY](https://github.com/raya-voice-ai/bakbak-python/blob/main/SECURITY.md)
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](https://github.com/raya-voice-ai/bakbak-python/blob/main/LICENSE).

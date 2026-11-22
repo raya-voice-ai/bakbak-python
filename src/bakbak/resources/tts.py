@@ -50,7 +50,7 @@ class TTS:
             voice_id: a voice from ``client.voices.list()``.
             language: e.g. ``"hi"``; ``m1`` voices use ``"en"`` for English.
             model: ``"standard"`` (the default) or ``"m1"``; it must match the voice.
-            speed: 0.5 to 1.5.
+            speed: 0.5 to 1.5. Changes ``standard`` voices only; ``m1`` ignores it.
             output_format: e.g. ``{"container": "wav", "encoding": "pcm_s16le",
                 "sample_rate": 24000}``. Without it the result is 24 kHz WAV.
             extra_headers: headers to add to this request.

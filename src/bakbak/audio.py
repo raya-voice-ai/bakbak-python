@@ -12,6 +12,11 @@ from ._utils import as_mapping
 
 __all__ = ["sample_size", "to_wav"]
 
+MP3_TO_WAV = (
+    "MP3 audio cannot be wrapped in WAV; decode it with an audio library, or request "
+    "output_format={'container': 'wav', 'encoding': 'pcm_s16le'} instead"
+)
+
 _SAMPLE_SIZES: dict[str, int] = {"pcm_f32le": 4, "pcm_s16le": 2, "pcm_mulaw": 1, "pcm_alaw": 1}
 # WAVE format tags: PCM, IEEE float, A-law, mu-law.
 _FORMAT_TAGS: dict[str, int] = {"pcm_s16le": 1, "pcm_f32le": 3, "pcm_alaw": 6, "pcm_mulaw": 7}
@@ -34,6 +39,53 @@ def stream_sample_size(output_format: object) -> int:
     return sample_size(encoding) if isinstance(encoding, str) else 1
 
 
+# (format tag, bits per sample) of a mono WAV, by encoding name.
+_WAV_ENCODINGS: dict[tuple[int, int], str] = {
+    (1, 16): "pcm_s16le",
+    (3, 32): "pcm_f32le",
+    (6, 8): "pcm_alaw",
+    (7, 8): "pcm_mulaw",
+}
+_WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+
+
+def is_wav(data: bytes) -> bool:
+    """Whether ``data`` starts like a WAV file."""
+    return len(data) >= 12 and data[:4] in (b"RIFF", b"RF64") and data[8:12] == b"WAVE"
+
+
+def wav_format(data: bytes) -> tuple[str, int] | None:
+    """The ``(encoding, sample_rate)`` a mono WAV file's ``fmt `` chunk states.
+
+    ``None`` for anything else: not WAV, more than one channel, an encoding the
+    API does not produce, or a header cut short. The RIFF and ``data`` sizes are
+    not trusted, since a WAV written as a stream may give them as 0xFFFFFFFF.
+    """
+    if not is_wav(data):
+        return None
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk, size = data[offset : offset + 4], struct.unpack_from("<I", data, offset + 4)[0]
+        body = offset + 8
+        if chunk == b"fmt ":
+            if size < 16 or body + 16 > len(data):
+                return None
+            tag, channels, rate, _, _, bits = struct.unpack_from("<HHIIHH", data, body)
+            if tag == _WAVE_FORMAT_EXTENSIBLE:
+                # The real tag is the first two bytes of the sub-format GUID.
+                if size < 40 or body + 26 > len(data):
+                    return None
+                tag = struct.unpack_from("<H", data, body + 24)[0]
+            encoding = _WAV_ENCODINGS.get((tag, bits))
+            if encoding is None or channels != 1 or rate <= 0:
+                return None
+            return encoding, rate
+        if chunk == b"data":
+            return None  # fmt must come before the audio
+        offset = body + size + (size & 1)
+    return None
+
+
 def to_wav(data: bytes, encoding: str, sample_rate: int) -> bytes:
     """Wrap raw mono audio in a WAV header.
 
@@ -46,6 +98,8 @@ def to_wav(data: bytes, encoding: str, sample_rate: int) -> bytes:
         ValueError: for an encoding WAV cannot carry this way (such as mp3), or
             a sample rate that is not a positive integer.
     """
+    if encoding == "mp3":
+        raise ValueError(MP3_TO_WAV)
     tag = _FORMAT_TAGS.get(encoding)
     if tag is None:
         known = ", ".join(sorted(_FORMAT_TAGS))

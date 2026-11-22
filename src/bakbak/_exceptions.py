@@ -274,8 +274,13 @@ def _nonempty(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
+# pydantic wraps a validator's ValueError as "Value error, <text>". The server's
+# own `message` quotes the text without it, so it is dropped before comparing.
+_PYDANTIC_VALUE_ERROR = "Value error, "
+
+
 def _render_detail(detail: list[object]) -> str | None:
-    """Render a validation ``detail`` list as ``"<loc> : <msg>"`` entries."""
+    """Render a validation ``detail`` list as ``"<loc>: <msg>"`` entries."""
     parts: list[str] = []
     for item in detail:
         entry = as_mapping(item)
@@ -285,6 +290,8 @@ def _render_detail(detail: list[object]) -> str | None:
                 parts.append(text)
             continue
         msg = _nonempty(entry.get("msg"))
+        if msg and msg.startswith(_PYDANTIC_VALUE_ERROR):
+            msg = _nonempty(msg[len(_PYDANTIC_VALUE_ERROR) :])
         loc = entry.get("loc")
         path = [str(p) for p in cast("list[object]", loc)] if isinstance(loc, list) else []
         if path and path[0] == "body":
