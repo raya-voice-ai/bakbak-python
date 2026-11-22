@@ -4,7 +4,7 @@ The async and the sync clients drive this one implementation, so they cannot
 differ in how they route messages, cancel, hold, resend or fail requests. The
 core never blocks: it changes state, appends events, and asks its driver to do
 anything that waits (open a connection, sleep, close a connection) through
-the ``Driver`` methods, which only schedule work.
+the ``Driver`` callbacks, which only schedule work.
 
 Vocabulary:
 
@@ -33,6 +33,7 @@ import time
 import weakref
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .._constants import WS_HEALTHY_AFTER, WS_MAX_CONTEXTS, WS_MAX_UNFINISHED
@@ -76,31 +77,30 @@ class Signal(Protocol):
     def notify(self) -> None: ...
 
 
-class Driver(Protocol):
-    """What the core asks of the async or sync client. None of it blocks."""
+class _Reconnect(Protocol):
+    def __call__(self, delay: float, *, force: bool) -> None: ...
 
-    def new_signal(self) -> Signal: ...
 
-    def schedule_flush(self) -> None:
-        """Send whatever became sendable (opening a connection if needed)."""
-        ...
+@dataclass(frozen=True, slots=True)
+class Driver:
+    """What the core asks of the async or sync client. None of it blocks.
 
-    def schedule_retry(self, request: Request, delay: float) -> None:
-        """After ``delay`` (with the injectable sleep), call ``retry_due``."""
-        ...
+    The client passes its own private methods, so they stay off its public
+    surface.
+    """
 
-    def schedule_reconnect(self, delay: float, *, force: bool) -> None:
-        """After ``delay``, flush; with ``force``, open a connection even if
-        nothing is waiting to be sent."""
-        ...
-
-    def abort(self, connection: Connection) -> None:
-        """Close a connection from the client side (code 1000)."""
-        ...
-
-    def notice(self, error: APIStatusError) -> None:
-        """Deliver an error that is about no request."""
-        ...
+    new_signal: Callable[[], Signal]
+    schedule_flush: Callable[[], None]
+    """Send whatever became sendable (opening a connection if needed)."""
+    schedule_retry: Callable[[Request, float], None]
+    """After ``delay`` (with the injectable sleep), call ``retry_due``."""
+    schedule_reconnect: _Reconnect
+    """After ``delay``, flush; with ``force``, open a connection even if
+    nothing is waiting to be sent."""
+    abort: Callable[[Connection], None]
+    """Close a connection from the client side (code 1000)."""
+    notice: Callable[[APIStatusError], None]
+    """Deliver an error that is about no request."""
 
 
 class Connection:

@@ -21,7 +21,7 @@ import bakbak
 from bakbak import AsyncBakbak, Bakbak, Timeout
 from bakbak._constants import WS_MAX_CONTEXTS, WS_MAX_UNFINISHED
 from bakbak._ws._common import check_context_id, text_delta
-from bakbak._ws._core import Core, Request
+from bakbak._ws._core import Core, Driver, Request
 from bakbak.text import split_sentences
 from bakbak.websocket import Cancelled, Chunk, Done, Failed
 
@@ -345,16 +345,16 @@ class _Signal:
         return
 
 
-class _Driver:
-    def new_signal(self) -> _Signal:
-        return _Signal()
+def _ignore(*args: object, **kwargs: object) -> None:
+    return
 
-    def __getattr__(self, name: str) -> Any:
-        return lambda *args, **kwargs: None
+
+def _driver() -> Driver:
+    return Driver(_Signal, _ignore, _ignore, _ignore, _ignore, _ignore)
 
 
 def test_back_pressure_limits() -> None:
-    core = Core(_Driver(), max_retries=2, read_timeout=None)  # type: ignore[arg-type]
+    core = Core(_driver(), max_retries=2, read_timeout=None)
 
     def handle(request: Request) -> object:
         return request
@@ -366,7 +366,7 @@ def test_back_pressure_limits() -> None:
     core.submit(busy, "{}", 1, handle)
     assert core.at_capacity(busy)
 
-    core = Core(_Driver(), max_retries=2, read_timeout=None)  # type: ignore[arg-type]
+    core = Core(_driver(), max_retries=2, read_timeout=None)
     for n in range(WS_MAX_CONTEXTS):
         core.submit(core.context(f"c{n}"), "{}", 1, handle)
     assert core.at_capacity(core.context("new"))

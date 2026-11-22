@@ -43,7 +43,7 @@ from ._common import (
     open_failure,
     text_delta,
 )
-from ._core import Connection, Core, Outcome, Request, State
+from ._core import Connection, Core, Driver, Outcome, Request, State
 from .events import Chunk, Failed, RequestResult, WebSocketEvent
 
 if TYPE_CHECKING:
@@ -414,7 +414,15 @@ class AsyncTTSWebSocket:
         self._client = client
         self._defaults: dict[str, object] = dict(defaults)
         self._on_error = on_error
-        self._core = Core(self, max_retries=client.max_retries, read_timeout=client.timeout.read)
+        driver = Driver(
+            new_signal=self._new_signal,
+            schedule_flush=self._schedule_flush,
+            schedule_retry=self._schedule_retry,
+            schedule_reconnect=self._schedule_reconnect,
+            abort=self._abort,
+            notice=self._notice,
+        )
+        self._core = Core(driver, max_retries=client.max_retries, read_timeout=client.timeout.read)
         self._send_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -493,22 +501,22 @@ class AsyncTTSWebSocket:
 
     # Driver: called by the core, never blocking
 
-    def new_signal(self) -> _Signal:
+    def _new_signal(self) -> _Signal:
         return _Signal()
 
-    def schedule_flush(self) -> None:
+    def _schedule_flush(self) -> None:
         self._spawn(self._flush())
 
-    def schedule_retry(self, request: Request, delay: float) -> None:
+    def _schedule_retry(self, request: Request, delay: float) -> None:
         self._spawn(self._retry_later(request, delay))
 
-    def schedule_reconnect(self, delay: float, *, force: bool) -> None:
+    def _schedule_reconnect(self, delay: float, *, force: bool) -> None:
         self._spawn(self._reconnect_later(delay, force))
 
-    def abort(self, connection: Connection) -> None:
+    def _abort(self, connection: Connection) -> None:
         self._spawn(self._close_transport(connection.transport))
 
-    def notice(self, error: APIStatusError) -> None:
+    def _notice(self, error: APIStatusError) -> None:
         if self._on_error is None:
             logger.debug("WebSocket error about no request: %s", error.message)
             return

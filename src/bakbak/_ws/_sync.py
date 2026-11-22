@@ -37,7 +37,7 @@ from ._common import (
     open_failure,
     text_delta,
 )
-from ._core import Connection, Core, Outcome, Request, State
+from ._core import Connection, Core, Driver, Outcome, Request, State
 from .events import Chunk, Failed, RequestResult, WebSocketEvent
 
 if TYPE_CHECKING:
@@ -366,7 +366,15 @@ class TTSWebSocket:
         self._watchdog: threading.Thread | None = None
         self._wake = threading.Event()
         self._readers: list[threading.Thread] = []
-        self._core = Core(self, max_retries=client.max_retries, read_timeout=client.timeout.read)
+        driver = Driver(
+            new_signal=self._new_signal,
+            schedule_flush=self._schedule_flush,
+            schedule_retry=self._schedule_retry,
+            schedule_reconnect=self._schedule_reconnect,
+            abort=self._abort,
+            notice=self._notice,
+        )
+        self._core = Core(driver, max_retries=client.max_retries, read_timeout=client.timeout.read)
 
     # Public API
 
@@ -452,13 +460,13 @@ class TTSWebSocket:
 
     # Driver: called by the core with the lock held, never blocking
 
-    def new_signal(self) -> _Signal:
+    def _new_signal(self) -> _Signal:
         return _Signal(self._lock)
 
-    def schedule_flush(self) -> None:
+    def _schedule_flush(self) -> None:
         self._spawn(self._flush)
 
-    def schedule_retry(self, request: Request, delay: float) -> None:
+    def _schedule_retry(self, request: Request, delay: float) -> None:
         def run() -> None:
             self._client._sleep(delay)
             with self._lock:
@@ -466,7 +474,7 @@ class TTSWebSocket:
 
         self._spawn(run)
 
-    def schedule_reconnect(self, delay: float, *, force: bool) -> None:
+    def _schedule_reconnect(self, delay: float, *, force: bool) -> None:
         def run() -> None:
             if delay:
                 self._client._sleep(delay)
@@ -474,10 +482,10 @@ class TTSWebSocket:
 
         self._spawn(run)
 
-    def abort(self, connection: Connection) -> None:
+    def _abort(self, connection: Connection) -> None:
         self._spawn(lambda: self._close_transport(connection.transport))
 
-    def notice(self, error: APIStatusError) -> None:
+    def _notice(self, error: APIStatusError) -> None:
         self._notices.append(error)
 
     # Internals
