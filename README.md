@@ -10,9 +10,9 @@ or over a WebSocket built for voice agents.
 - Automatic, safe retries: never after audio has been delivered
 - Typed throughout (`py.typed`), with three runtime dependencies: `httpx`, `websockets`, `typing-extensions`
 
-Documentation: [Python SDK guide](https://docs.litwizlabs.com/documentation/sdk-python) ·
-[WebSocket API reference](https://docs.litwizlabs.com/api-reference/tts-websocket) ·
-[Errors](https://docs.litwizlabs.com/documentation/tts-errors)
+Documentation: [Python SDK guide](https://docs.bakbak.si/sdks/python) ·
+[WebSocket API reference](https://docs.bakbak.si/text-to-speech/websocket) ·
+[Errors](https://docs.bakbak.si/text-to-speech/errors)
 
 ## Install
 
@@ -355,7 +355,7 @@ Errors never contain your API key or request headers, in any attribute, `str()`,
 (a copy-paste slip) is refused when the client is created, without echoing it.
 The SDK never follows redirects, on HTTP or the WebSocket: a 3xx is an
 `APIStatusError`, so the key is never sent to another origin. See the
-[error reference](https://docs.litwizlabs.com/documentation/tts-errors) for every
+[error reference](https://docs.bakbak.si/text-to-speech/errors) for every
 `error_code`.
 
 ## Retries and timeouts
@@ -421,9 +421,9 @@ logging.getLogger("bakbak").setLevel(logging.DEBUG)
 
 ## More
 
-- [Python SDK guide](https://docs.litwizlabs.com/documentation/sdk-python)
-- [WebSocket API reference](https://docs.litwizlabs.com/api-reference/tts-websocket)
-- [Errors and error codes](https://docs.litwizlabs.com/documentation/tts-errors)
+- [Python SDK guide](https://docs.bakbak.si/sdks/python)
+- [WebSocket API reference](https://docs.bakbak.si/text-to-speech/websocket)
+- [Errors and error codes](https://docs.bakbak.si/text-to-speech/errors)
 - [`examples/`](https://github.com/raya-voice-ai/bakbak-python/tree/main/examples): runnable scripts for each feature
 - [`conformance/BEHAVIOR.md`](https://github.com/raya-voice-ai/bakbak-python/blob/main/conformance/BEHAVIOR.md): the behaviour
   every official Bakbak client follows, and the API in one page
