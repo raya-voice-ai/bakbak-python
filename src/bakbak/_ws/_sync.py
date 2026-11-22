@@ -31,11 +31,11 @@ from ..text import Segmenter
 from ..types import RequestDefaults, SendParams
 from ._common import (
     WEBSOCKET_LOGGER,
+    StreamText,
     build_request,
     check_context_id,
     connect_error,
     open_failure,
-    text_delta,
 )
 from ._core import Connection, Core, Driver, Outcome, Request, State
 from .events import Chunk, Failed, RequestResult, WebSocketEvent
@@ -249,25 +249,31 @@ class Context:
         sentence as each sentence is final.
 
         ``tokens`` is an iterable of ``str``, or of stream events from an LLM
-        SDK (OpenAI, Anthropic or Gemini style; the text delta is found by
-        duck typing). It blocks until ``tokens`` is exhausted, so read the
-        audio on another thread. A ``cancel()`` of the context stops it: it
-        sends nothing more and returns (after the next token arrives). Calls
-        ``end_input()`` at the end unless ``end_input=False``, also when
-        ``tokens`` raises.
+        SDK (OpenAI, Anthropic or Gemini style, or Gemini's raw JSON; the text
+        delta is found by duck typing). It blocks until ``tokens`` is
+        exhausted, so read the audio on another thread. A ``cancel()`` of the
+        context stops it: it sends nothing more and returns (after the next
+        token arrives). Calls ``end_input()`` at the end unless
+        ``end_input=False``, also when ``tokens`` raises.
 
         Args:
             segmenter: a configured :class:`bakbak.text.Segmenter`, e.g. with
                 ``eager_first_clause=True`` for an earlier first request.
+
+        Raises:
+            TypeError: when ``tokens`` ends having yielded no text, and some of
+                its items have none of the shapes above (raised after
+                ``end_input()``). Map such events to ``str`` first.
         """
         splitter = segmenter or Segmenter()
         handles: list[RequestHandle] = []
         epoch = self._ctx.cancel_epoch
+        texts = StreamText()
         try:
             for item in tokens:
                 if self._ctx.cancel_epoch != epoch:
                     return handles
-                text = text_delta(item)
+                text = texts.read(item)
                 if not text:
                     continue
                 for sentence in splitter.push(text):
@@ -283,6 +289,8 @@ class Context:
         finally:
             if end_input:
                 self.end_input()
+        if self._ctx.cancel_epoch == epoch:  # not if a cancel came after the last token
+            texts.check()
         return handles
 
     def end_input(self) -> None:

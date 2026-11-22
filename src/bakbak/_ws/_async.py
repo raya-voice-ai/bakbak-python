@@ -37,11 +37,11 @@ from ..text import Segmenter
 from ..types import RequestDefaults, SendParams
 from ._common import (
     WEBSOCKET_LOGGER,
+    StreamText,
     build_request,
     check_context_id,
     connect_error,
     open_failure,
-    text_delta,
 )
 from ._core import Connection, Core, Driver, Outcome, Request, State
 from .events import Chunk, Failed, RequestResult, WebSocketEvent
@@ -85,7 +85,8 @@ def _signal(core_signal: object) -> _Signal:
     return core_signal
 
 
-_STOP = object()
+_STOP = object()  # a cancel (or the WebSocket closing) stopped send_stream
+_END = object()  # the tokens ended
 
 
 async def _iterate(
@@ -269,26 +270,36 @@ class AsyncContext:
         sentence as each sentence is final.
 
         ``tokens`` may be an iterable or an async iterable of ``str``, or of
-        stream events from an LLM SDK (OpenAI, Anthropic or Gemini style; the
-        text delta is found by duck typing). A sync iterable is read on the
+        stream events from an LLM SDK (OpenAI, Anthropic or Gemini style, or
+        Gemini's raw JSON; the text delta is found by duck typing). A sync iterable is read on the
         event loop, so it should not block. Calls ``end_input()`` at the end
         unless ``end_input=False``, also when ``tokens`` raises.
 
         Args:
             segmenter: a configured :class:`bakbak.text.Segmenter`, e.g. with
                 ``eager_first_clause=True`` for an earlier first request.
+
+        Raises:
+            TypeError: when ``tokens`` ends having yielded no text, and some of
+                its items have none of the shapes above (raised after
+                ``end_input()``). Map such events to ``str`` first.
         """
         splitter = segmenter or Segmenter()
         handles: list[AsyncRequestHandle] = []
         epoch = self._ctx.cancel_epoch
         items = _iterate(tokens)
         racing = isinstance(tokens, AsyncIterable)
+        texts = StreamText()
+        ended = False
         try:
             while True:
                 item = await self._next_item(items, epoch, racing)
                 if item is _STOP:
                     break
-                text = text_delta(item)
+                if item is _END:
+                    ended = True
+                    break
+                text = texts.read(item)
                 if not text:
                     continue
                 for sentence in splitter.push(text):
@@ -305,14 +316,16 @@ class AsyncContext:
             await items.aclose()
             if end_input:
                 self.end_input()
+        if ended and self._ctx.cancel_epoch == epoch:
+            texts.check()
         return handles
 
     async def _next_item(
         self, items: AsyncGenerator[object, None], epoch: int, racing: bool
     ) -> object:
-        """The next token, or ``_STOP`` when the tokens end or the context is
-        cancelled: a cancel stops ``send_stream`` even while it waits for a
-        slow LLM (§6.3)."""
+        """The next token; ``_END`` when the tokens end, or ``_STOP`` when the
+        context is cancelled: a cancel stops ``send_stream`` even while it
+        waits for a slow LLM (§6.3)."""
         ctx = self._ctx
         if ctx.cancel_epoch != epoch:
             return _STOP
@@ -320,7 +333,7 @@ class AsyncContext:
             try:
                 return await items.__anext__()
             except StopAsyncIteration:
-                return _STOP
+                return _END
         getter = asyncio.ensure_future(items.__anext__())
         watcher = asyncio.ensure_future(self._cancelled_since(epoch))
         try:
@@ -337,7 +350,7 @@ class AsyncContext:
         try:
             return getter.result()
         except StopAsyncIteration:
-            return _STOP
+            return _END
 
     async def _cancelled_since(self, epoch: int) -> None:
         core = self._ws._core

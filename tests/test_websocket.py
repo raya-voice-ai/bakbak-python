@@ -20,7 +20,7 @@ from conformance_support import MockWSServer
 import bakbak
 from bakbak import AsyncBakbak, Bakbak, Timeout
 from bakbak._constants import WS_MAX_CONTEXTS, WS_MAX_UNFINISHED
-from bakbak._ws._common import check_context_id, text_delta
+from bakbak._ws._common import StreamText, check_context_id, text_delta
 from bakbak._ws._core import Core, Driver, Request
 from bakbak.text import split_sentences
 from bakbak.websocket import Cancelled, Chunk, Done, Failed
@@ -281,6 +281,175 @@ def test_sync_send_stream_with_a_thread_reading_audio() -> None:
             assert [h.result(timeout=5).request_id for h in handles] == ["req_0", "req_1"]
         server.assert_complete(1)
     assert b"".join(received) == b"\x01\x02" * 2
+
+
+# Input send_stream cannot read (§6.2): it ends input as usual, then raises.
+
+SECRET = "private words of the user"
+UNREADABLE: list[object] = [{"secret": SECRET}, ("tuple", SECRET), 42]
+TOOL_CALLS: list[object] = [
+    SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content=None, role="assistant"))]
+    ),
+    SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content=None, tool_calls=[{"index": 0}]))]
+    ),
+    SimpleNamespace(choices=[], usage=SimpleNamespace(total_tokens=9)),
+]
+
+
+def test_stream_text_tells_unreadable_input_from_input_without_text() -> None:
+    def check(items: list[object]) -> None:
+        texts = StreamText()
+        for item in items:
+            texts.read(item)
+        texts.check()
+
+    with pytest.raises(TypeError) as raised:
+        check(UNREADABLE)
+    message = str(raised.value)
+    assert message == (
+        "send_stream() found no text in 3 items. It reads str, OpenAI Chat Completions and "
+        "Responses events, Anthropic events, Gemini responses (SDK objects or raw JSON) and "
+        "objects with a text or content string; map other events to str first."
+    )
+    assert SECRET not in message
+    with pytest.raises(TypeError, match=r"found no text in 1 item\. "):
+        check([object()])
+    # One unreadable item among items it knows, none with text.
+    with pytest.raises(TypeError, match="in 4 items"):
+        check([*TOOL_CALLS, None])
+    # Nothing to complain about: no items, text somewhere, or only known shapes.
+    check([])
+    check([{"secret": SECRET}, "Hello."])
+    check(["Hello.", 42])
+    check(TOOL_CALLS)
+    check(["", ""])
+    check([{"type": "message_start", "message": {}}, {"type": "message_stop"}])
+    check([{"content": ""}, {"text": None, "type": "text"}, {"delta": {"partial_json": "{"}}])
+    check([{"candidates": [{"finishReason": "STOP"}]}, {"choices": []}])
+
+
+def _input_ended(ctx: Any) -> bool:
+    return bool(ctx._ctx.input_ended)
+
+
+async def test_async_send_stream_raises_for_input_it_cannot_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    async def tokens(items: list[object]) -> AsyncIterator[object]:
+        for item in items:
+            yield item
+
+    with MockWSServer([]) as server:
+        client = _client(server)
+        ws = client.tts.websocket(**DEFAULTS)  # opens on the first send: none here
+        ctx = ws.context()
+        with pytest.raises(TypeError, match="found no text in 3 items") as raised:
+            await ctx.send_stream(tokens(UNREADABLE))
+        assert SECRET not in str(raised.value)
+        assert _input_ended(ctx)  # ended first, as it would have been
+        # A sync iterable, and end_input=False respected.
+        kept = ws.context()
+        with pytest.raises(TypeError, match="found no text in 3 items"):
+            await kept.send_stream(iter(UNREADABLE), end_input=False)
+        assert not _input_ended(kept)
+        # Known shapes without text (an OpenAI tool call) are not an error.
+        calls = ws.context()
+        assert await calls.send_stream(tokens(TOOL_CALLS)) == []
+        assert _input_ended(calls)
+        assert await ws.context().send_stream(tokens([])) == []
+        await ws.close()
+        await client.close()
+        server.assert_complete(0)
+    assert all(SECRET not in r.getMessage() for r in caplog.records)
+
+
+async def test_async_send_stream_stopped_by_cancel_does_not_raise() -> None:
+    consumed = asyncio.Event()
+    stalled = asyncio.Event()
+
+    async def tokens() -> AsyncIterator[object]:
+        yield {"secret": SECRET}
+        consumed.set()
+        await stalled.wait()  # the LLM stalls; never released
+        yield 42
+
+    with MockWSServer([]) as server:
+        client = _client(server)
+        ws = client.tts.websocket(**DEFAULTS)
+        ctx = ws.context()
+        streaming = asyncio.create_task(ctx.send_stream(tokens()))
+        await asyncio.wait_for(consumed.wait(), 2)
+        await ctx.cancel()
+        assert await asyncio.wait_for(streaming, 2) == []
+        assert _input_ended(ctx)
+        await ws.close()
+        await client.close()
+        server.assert_complete(0)
+
+
+def test_sync_send_stream_raises_for_input_it_cannot_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    with MockWSServer([]) as server:
+        client = Bakbak(api_key="test-key", base_url=server.base_url)
+        ws = client.tts.websocket(**DEFAULTS)  # opens on the first send: none here
+        ctx = ws.context()
+        with pytest.raises(TypeError, match="found no text in 3 items") as raised:
+            ctx.send_stream(iter(UNREADABLE))
+        assert SECRET not in str(raised.value)
+        assert _input_ended(ctx)
+        kept = ws.context()
+        with pytest.raises(TypeError, match="found no text in 1 item"):
+            kept.send_stream([object()], end_input=False)
+        assert not _input_ended(kept)
+        calls = ws.context()
+        assert calls.send_stream(iter(TOOL_CALLS)) == []
+        assert _input_ended(calls)
+        assert ws.context().send_stream([]) == []
+        ws.close()
+        client.close()
+        server.assert_complete(0)
+    assert all(SECRET not in r.getMessage() for r in caplog.records)
+
+
+def test_sync_send_stream_stopped_by_cancel_does_not_raise() -> None:
+    consumed = threading.Event()
+    release = threading.Event()
+
+    def tokens() -> Any:
+        yield {"secret": SECRET}
+        consumed.set()
+        release.wait(5)  # the cancel lands after the last token: the input then ends
+
+    with MockWSServer([]) as server:
+        client = Bakbak(api_key="test-key", base_url=server.base_url)
+        ws = client.tts.websocket(**DEFAULTS)
+        ctx = ws.context()
+        outcome: list[object] = []
+
+        def run() -> None:
+            try:
+                outcome.append(ctx.send_stream(tokens()))
+            except Exception as exc:
+                outcome.append(exc)
+
+        streaming = threading.Thread(target=run)
+        streaming.start()
+        assert consumed.wait(5)
+        ctx.cancel()
+        release.set()
+        streaming.join(5)
+        assert not streaming.is_alive()
+        assert outcome == [[]]
+        assert _input_ended(ctx)
+        ws.close()
+        client.close()
+        server.assert_complete(0)
 
 
 async def test_send_after_end_input_raises() -> None:

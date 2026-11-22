@@ -25,6 +25,7 @@ from ..audio import stream_sample_size
 
 __all__ = [
     "WEBSOCKET_LOGGER",
+    "StreamText",
     "build_request",
     "check_context_id",
     "connect_error",
@@ -162,6 +163,53 @@ def text_delta(item: object) -> str | None:
         return text
     content = _field(item, "content")
     return content if isinstance(content, str) else None
+
+
+# Fields whose presence means text_delta knows the item's shape, even when it
+# carries no text (an OpenAI tool-call chunk, an Anthropic message_start).
+_SHAPE_FIELDS = ("choices", "type", "delta", "text", "content", "candidates")
+
+
+def _recognised(item: object) -> bool:
+    return isinstance(item, str) or any(_field(item, name) is not None for name in _SHAPE_FIELDS)
+
+
+class StreamText:
+    """Reads ``send_stream``'s items with :func:`text_delta`, and remembers
+    enough to tell input it cannot read from input that had no text (§6.2).
+
+    It never keeps an item, only a count and two flags, so nothing of the
+    input can reach an error message or a log.
+    """
+
+    __slots__ = ("_found", "_items", "_unrecognised")
+
+    def __init__(self) -> None:
+        self._items = 0
+        self._found = False
+        self._unrecognised = False
+
+    def read(self, item: object) -> str | None:
+        """The text ``item`` carries, if any."""
+        self._items += 1
+        text = text_delta(item)
+        if text:
+            self._found = True
+        elif not self._found and not self._unrecognised and not _recognised(item):
+            self._unrecognised = True
+        return text
+
+    def check(self) -> None:
+        """At the end of the input: raise if there were items, none had text,
+        and at least one had none of the shapes ``text_delta`` reads."""
+        if self._items and not self._found and self._unrecognised:
+            items = "item" if self._items == 1 else "items"
+            raise TypeError(
+                f"send_stream() found no text in {self._items} {items}. It reads str, "
+                "OpenAI Chat Completions and Responses events, Anthropic events, Gemini "
+                "responses (SDK objects or raw JSON) and objects with a text or content "
+                "string; map other events to str first."
+            )
 
 
 def connect_error(exc: BaseException) -> tuple[BakbakError, str | None] | None:
