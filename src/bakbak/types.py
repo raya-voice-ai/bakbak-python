@@ -69,7 +69,7 @@ class SynthesisParams(TypedDict, total=False):
     language: Required[Language]
     model: Model
     speed: float
-    """0.5 to 1.5; default 1.0."""
+    """0.5 to 1.5; default 1.0. Changes ``standard`` voices only; ``m1`` ignores it."""
     output_format: OutputFormat
 
 
