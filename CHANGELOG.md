@@ -5,6 +5,13 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/), and entries after 1.0.0rc1 are
 written by release-please from the commit history.
 
+## [1.0.0-rc.5](https://github.com/raya-voice-ai/bakbak-python/compare/v1.0.0-rc.4...v1.0.0-rc.5) (2026-11-22)
+
+
+### Documentation
+
+* point documentation links at docs.bakbak.si ([#6](https://github.com/raya-voice-ai/bakbak-python/issues/6)) ([8b794dc](https://github.com/raya-voice-ai/bakbak-python/commit/8b794dc599306080fd3de1c47bc875fd719b6ae3))
+
 ## [1.0.0-rc.4](https://github.com/raya-voice-ai/bakbak-python/compare/v1.0.0-rc.3...v1.0.0-rc.4) (2026-11-22)
 
 
