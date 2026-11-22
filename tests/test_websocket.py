@@ -318,12 +318,14 @@ def test_stream_text_tells_unreadable_input_from_input_without_text() -> None:
         check([object()])
     # One unreadable item among items it knows, none with text.
     with pytest.raises(TypeError, match="in 4 items"):
-        check([*TOOL_CALLS, None])
+        check([*TOOL_CALLS, object()])
     # Nothing to complain about: no items, text somewhere, or only known shapes.
     check([])
     check([{"secret": SECRET}, "Hello."])
     check(["Hello.", 42])
     check(TOOL_CALLS)
+    check([None, None])  # events mapped to text, None for the rest: a tool-call-only reply
+    check([*TOOL_CALLS, None])
     check(["", ""])
     check([{"type": "message_start", "message": {}}, {"type": "message_stop"}])
     check([{"content": ""}, {"text": None, "type": "text"}, {"delta": {"partial_json": "{"}}])

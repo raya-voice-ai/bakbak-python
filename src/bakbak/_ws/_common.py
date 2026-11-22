@@ -171,7 +171,13 @@ _SHAPE_FIELDS = ("choices", "type", "delta", "text", "content", "candidates")
 
 
 def _recognised(item: object) -> bool:
-    return isinstance(item, str) or any(_field(item, name) is not None for name in _SHAPE_FIELDS)
+    # None is a known item without text: code that maps events to text often
+    # yields None for the others, and a reply that is only a tool call is all None.
+    return (
+        item is None
+        or isinstance(item, str)
+        or any(_field(item, name) is not None for name in _SHAPE_FIELDS)
+    )
 
 
 class StreamText:

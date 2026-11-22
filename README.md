@@ -244,8 +244,9 @@ If the tokens end with no text, and some of them had none of the shapes above
 (a framework's own event objects, say, or tuples), `send_stream` ends input as
 usual and then raises `TypeError` naming the shapes it reads, rather than
 return having sent nothing: map such events to `str` first. A stream it can
-read that simply has no text, such as one that only calls tools, is not an
-error, and neither is a `send_stream` stopped by `cancel()`.
+read that simply has no text, such as one that only calls tools (or yields
+`None` for events without text), is not an error, and neither is a
+`send_stream` stopped by `cancel()`.
 
 See [`examples/llm_streaming.py`](https://github.com/raya-voice-ai/bakbak-python/blob/main/examples/llm_streaming.py).
 
